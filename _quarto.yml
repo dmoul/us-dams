@@ -1,0 +1,51 @@
+project:
+  type: book
+
+book:
+  title: "A look at US Dams"
+  subtitle: "From the National Inventory of Dams"
+  author: "Daniel Moul"
+  date: now
+  chapters:
+    - index.qmd
+    - summary.qmd
+    - risk.qmd
+    - asce-grades.qmd
+    - maps.qmd
+    - numbers.qmd
+    - owners-nc.qmd
+    - drainage.qmd
+    - dams-and-waterways.qmd
+    - ruggedness.qmd
+    - ruggedness-preparing.qmd
+    - notes.qmd
+  page-footer: 
+    center: "Copyright 2026 by [Daniel Moul](https://dmoul.github.io). License: [CC-BY 4.0](http://creativecommons.org/licenses/by/4.0/)"
+  search: false
+
+license: "CC BY"
+
+execute: 
+  freeze: false
+  warning: false
+
+# bibliography: references.bib
+
+filters:
+  - auto-dark
+
+format:
+  html:
+    # theme: cosmo
+    # fig-format: svg
+    toc: true
+    toc-depth: 4
+    toc-expand: 3
+    number-sections: true
+    code-fold: true
+    code-summary: "Show the code"
+    theme:
+      light: cosmo #sandstone  #lux  #cosmo # your preferred light theme
+      # dark: darkly        # your preferred dark theme (when using auto-dark extension, set only a light theme)
+    css: _extensions/gadenbuie/auto-dark/auto-dark-mode.css
+

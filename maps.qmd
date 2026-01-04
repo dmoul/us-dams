@@ -1,0 +1,391 @@
+# Maps {#sec-dam-maps}
+
+```{r}
+#| label: setup
+#| include: false
+
+source(here::here("scripts/setup.R"))
+
+source(here::here("scripts/prepare-data.R"))
+
+```
+
+Let's start with two choropleth maps: @fig-dams-in-continental-states-map-count-area-per-dam shows number of dams and square miles per dam in each state. It's a plot of `r comma(nrow(dams))` dams in the National Inventory of Dams (NID) in the continental USA. 
+
+```{r}
+dta_for_plot <- state_boundaries_sf |>
+  left_join(dams_by_state |>
+              st_drop_geometry(),
+            by = join_by(state_abb)) |>
+  # Should I include water as well as land in the state area calc below? As long as I'm consistent either is OK.
+  mutate(state_area_mi2 = (aland + awater) / 2589988.110336,  # convert from m^2 to mi^2
+         dams_per_mi2 = n / state_area_mi2,
+         mi2_per_dam = state_area_mi2 / n
+  )
+
+dta_for_plot |>
+  st_drop_geometry() |>
+  arrange(desc(n)) |>
+  head(5) |>
+  select(state_abb, n) |>
+  gt() |>
+  tab_header(md("**States with the most dams**"))
+```
+
+<br>
+
+States with the fewest dams are small (NJ, RI, VT) or very dry (ID, AZ, NM). States with the most dams are wet, large and/or had a compelling need for flood control (MS, GA, TX, MO).
+
+The states with the fewest square miles per dam come from New England states (CT, RI, MA) and (because there are so many dams: MS). The dry states in the west (ID, NV, AZ, NM) have the most square miles per dam:
+
+```{r}
+#| label: fig-dams-in-continental-states-map-count-area-per-dam
+#| fig-cap: "Maps of dams in the continental states colored by number of dams and square miles per dam in each state"
+#| fig-height: 11
+#| fig-width: 10
+#| column: page-right
+#| eval: true
+
+p1 <- dta_for_plot |>
+  ggplot() +
+  geom_sf(aes(fill = n),
+          size = 0.01,
+          color = "grey50",
+          alpha = 0.75) +
+  scale_fill_gradient(trans = "log",
+                     low = "blue",
+                     high = "gold",
+                     breaks = c(148, 300, 1000, 3000, 7200) # set manual breaks to get "clean" numbers
+                     ) +
+  guides(fill = guide_legend(
+    reverse = TRUE,
+    position = "inside")) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position.inside = c(0.9, 0.3)) +
+  labs(
+    subtitle = "A. Dam count",
+    fill = "Number of dams"
+  )
+
+p2 <- dta_for_plot |>
+  ggplot() +
+  geom_sf(aes(fill = mi2_per_dam),
+          size = 0.01,
+          color = "grey50",
+          alpha = 0.7) +
+  scale_fill_gradient(trans = "log",
+                     low = "blue",
+                     high = "gold",
+                     breaks = c(8, 20, 50, 150, 300) # set manual breaks to get "clean" numbers
+                     ) +
+  guides(fill = guide_legend(
+    reverse = TRUE,
+    position = "inside")) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position.inside = c(0.9, 0.3)) +
+  labs(
+    subtitle = "B. Square miles per dam",
+    fill = "Sq mi per dam"
+  )
+
+p1 / p2 +
+  plot_annotation(
+    title = "Dams in the National Inventory of Dams",
+    subtitle = "Continental USA",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+Plotting dam locations colored by purpose in @fig-dams-in-continental-states-map-primary-purpose, even without showing state state borders, we can see some regional and state differences^[Some differences may be due to differences in state-level policies related to data collection than to the number of dams; others may be due to geographical differences, since it was common to put borders where the geography changes.]:
+
+* A north-south swath of dams in Texas and further north for flood protection
+* A paucity of dams in the NID in Kansas, with a much higher density of dams just north of the border in Nebraska
+* A cluster of dams for grade stabilization in northern Missouri and southern Iowa
+* A high density of recreational dams in Mississippi
+* Dams for hydroelectric generation clustered in the northeast with clusters above the [fall line](https://en.wikipedia.org/wiki/Fall_line) in the Mid- and South-Atlantic states, in the Sierras, and in Wisconsin and Michigan.
+
+```{r}
+#| label: fig-dams-in-continental-states-map-primary-purpose
+#| fig-cap: "Map of dams in the continental states colored by `primaryPurpose`"
+#| fig-height: 10
+#| fig-width: 18
+#| column: page-right
+#| eval: true
+
+ggplot() +
+  geom_sf(data = continental_us_border, # state_boundaries_sf, 
+          fill = NA,
+          color = "grey50") +
+  geom_sf(data = dams |>
+            mutate(n_primaryPurposeId = n(),
+                   .by = primaryPurposeId) |>
+            mutate(primaryPurposeId = fct_reorder(primaryPurposeId, -n_primaryPurposeId)),
+          aes(color = primaryPurposeId),
+          size = 0.01,
+          alpha = 0.5) +
+  guides(color = guide_legend(override.aes = list(size = 3),
+                              position = "inside")) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position.inside = c(0.9, 0.3)) +
+  labs(
+    title = "Dams in in the National Inventory of Dams - colored by `primaryPurpose`",
+    subtitle = "Continental USA",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+@fig-dams-in-states-map-primary-purpose-facet makes the clusters by region and state easier to see.
+
+```{r}
+#| label: fig-dams-in-states-map-primary-purpose-facet
+#| fig-cap: "Map of dams in the continental USA by `primaryPurpose`"
+#| fig-height: 10
+#| fig-width: 10
+#| column: page-right
+#| eval: true
+
+ggplot() +
+  geom_sf(data = state_boundaries_sf,
+          color = "grey50",
+          linewidth = 0.1,
+          fill = NA) +
+  geom_sf(data = dams |>
+            mutate(n_primaryPurposeId = n(),
+                   .by = primaryPurposeId) |>
+            mutate(primaryPurposeId_label = glue("{primaryPurposeId} (n={n_primaryPurposeId})"),
+                   primaryPurposeId_label = fct_reorder(primaryPurposeId_label, -n_primaryPurposeId)),
+          aes(color = primaryPurposeId_label),
+          size = 0.01,
+          alpha = 0.5) +
+  guides(color = "none") +
+  facet_wrap( ~ primaryPurposeId_label, ncol = 3) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  labs(
+    title = "Dams faceted by `primaryPurpose`",
+    subtitle = "Continental USA",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+## Dams by height
+
+A similar map colored by `damHeight` (@fig-dams-in-states-map-nidHeight) makes visible other patterns:
+
+* There are a lot of small dams < 25 ft high along the east coast and in the north central and north east.
+* There is a cluster of big dams in and around the Tennessee Valley and in the Sierra Nevada mountains of California.
+
+```{r}
+#| label: fig-dams-in-states-map-nidHeight
+#| fig-cap: "Map of dams colored by `damHeight` in the continental states"
+#| fig-height: 10
+#| fig-width: 18
+#| column: page-right
+#| eval: true
+
+dta_for_plot <- dams |>
+            mutate(n_nidHeightId = n(),
+                   .by = nidHeightId) |>
+            mutate(nidHeightId_label = glue("{nidHeightId} (n={n_nidHeightId})"),
+                   nidHeightId_label = fct_reorder(nidHeightId_label, -n_nidHeightId))
+
+ggplot() +
+  geom_sf(data = dta_for_plot,
+          aes(color = nidHeightId_label),
+          size = 0.01,
+          alpha = 0.5) +
+  guides(color = guide_legend(override.aes = list(size = 3),
+                              position = "inside")) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position.inside = c(0.9, 0.3)) +
+  labs(
+    title = "Dams in in the National Inventory of Dams - colored by `damHeight`",
+    subtitle = "Continental USA",
+    caption = my_caption,
+    color = "Dam height"
+  )
+
+```
+
+<br>
+
+Again the same information faceted (@fig-dams-in-states-map-nidHeight-facet) make some patterns easier to see.
+
+```{r}
+#| label: fig-dams-in-states-map-nidHeight-facet
+#| fig-cap: "Map of dams in the continental USA by `damHeight`"
+#| fig-height: 6
+#| fig-width: 10
+#| column: page-right
+#| eval: true
+
+ggplot() +
+  geom_sf(data = state_boundaries_sf,
+          color = "grey50",
+          linewidth = 0.1,
+          fill = NA) +
+  geom_sf(data = dta_for_plot,
+          aes(color = nidHeightId_label),
+          size = 0.01,
+          alpha = 0.5) +
+  guides(color = "none") +
+  facet_wrap( ~ nidHeightId_label, ncol = 3) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  labs(
+    title = "Dams faceted by height (`nidHeightId`)",
+    subtitle = "Continental USA",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+## Big dams
+
+The NID categorizes dams by height in `nidHeightId`. The tallest category includes dams that are more than `r big_dam_height_cutoff` ft high. Let's call them "big dams".
+
+```{r}
+#| label: fig-dams-in-states-map-big-dams
+#| fig-cap: "Map of big dams in the continental USA"
+#| fig-height: 10
+#| fig-width: 18
+#| column: page-right
+#| eval: true
+
+n_big_dams <- dams |>
+  filter(big_dam) |>
+  nrow()
+
+ggplot() +
+  geom_sf(data = state_boundaries_sf,
+          color = "grey50",
+          fill = NA) +
+  geom_sf(data = dams |>
+            filter(big_dam) |>
+            mutate(n_primaryPurposeId = n(),
+                   .by = primaryPurposeId) |>
+            mutate(primaryPurposeId = glue("{primaryPurposeId} (n={n_primaryPurposeId})"),
+                   primaryPurposeId = fct_reorder(primaryPurposeId, -n_primaryPurposeId)),
+          aes(color = primaryPurposeId),
+          size = 1,
+          alpha = 0.75) +
+  guides(color = guide_legend(override.aes = list(size = 3),
+                              position = "inside")) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position.inside = c(0.9, 0.3)) +
+  labs(
+    title = glue("There are {n_big_dams} big dams in in the National Inventory of Dams"),
+    subtitle = "Continental USA",
+    caption = my_caption,
+    color = "Primary purpose"
+  )
+
+```
+
+<br>
+
+Faceting by their `primaryPurpose` (@fig-dams-in-states-map-primary-purpose-big-dams-facet) makes the patterns easier to see.
+
+```{r}
+#| label: fig-dams-in-states-map-primary-purpose-big-dams-facet
+#| fig-cap: "Map of big dams by primary purpose"
+#| fig-height: 10
+#| fig-width: 10
+#| column: page-right
+#| eval: true
+
+dta_for_plot <- dams |>
+            filter(big_dam) |>
+            mutate(n_primaryPurposeId = n(),
+                   .by = primaryPurposeId) |>
+            mutate(primaryPurposeId_label = glue("{primaryPurposeId} (n={n_primaryPurposeId})"),
+                   primaryPurposeId_label = fct_reorder(primaryPurposeId_label, -n_primaryPurposeId))
+
+ggplot() +
+  geom_sf(data = state_boundaries_sf,
+          color = "grey50",
+          linewidth = 0.1,
+          fill = NA) +
+  geom_sf(data = dta_for_plot,
+          aes(color = primaryPurposeId_label),
+          size = 0.5,
+          alpha = 0.5) +
+  guides(color = "none") +
+  facet_wrap( ~ primaryPurposeId_label, ncol = 3) +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank()) +
+  labs(
+    title = "Big dams faceted by primary purpose",
+    subtitle = "Continental USA",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+Most of the big dams (@fig-big-dams-primary-purpose-pareto) are primarily for flood risk reduction, water supply, hydroelectric power, and to hold mine tailings.
+
+```{r}
+#| label: fig-big-dams-primary-purpose-pareto
+#| fig-cap: "Map of big dams in the continental USA"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+dta_for_plot2 <- dta_for_plot |>
+  distinct(primaryPurposeId_label, n_primaryPurposeId)
+
+n_dams <- sum(dta_for_plot2$n_primaryPurposeId)
+pct80 <- round(n_dams * 0.8)
+
+dta_for_plot2 |>
+  arrange(desc(n_primaryPurposeId)) |>
+  mutate(primaryPurposeId_label = fct_reorder(primaryPurposeId_label, n_primaryPurposeId),
+         cum_n = cumsum(n_primaryPurposeId)) |>
+  ggplot(aes(cum_n, primaryPurposeId_label, group = cum_n)) +
+  # geom_line() +
+  geom_vline(xintercept = pct80,
+             lty = 2, linewidth = 0.2, alpha = 0.5) +
+  geom_point() +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.04))) +
+  expand_limits(x = 0) +
+  theme(plot.title.position = "plot") +
+  labs(
+    title = "Count of big dam's primary purpose",
+    subtitle = glue("Vertical line is 80% ({pct80}) of the {n_dams} big dams"),
+    y = NULL,
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+There are more insights to be gleaned by looking at other numerical distributions and summaries. That's the focus of the next chapter.
+
+<br>

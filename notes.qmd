@@ -1,0 +1,372 @@
+# Notes and limitations {#sec-notes}
+
+```{r}
+#| label: setup
+#| include: false
+
+source(here::here("scripts/setup.R"))
+
+source(here::here("scripts/prepare-data.R"))
+
+```
+
+## Source notes
+
+### National Inventory of Dams
+
+There is a useful, simple overview at <https://nid.sec.usace.army.mil/#/dam-basics/what-is-a-dam>. See also <https://nid.sec.usace.army.mil/#/about-the-nid/data> and <https://nid.sec.usace.army.mil/#/about-the-nid/faq>
+
+There is a [glossary of terms](https://www.fema.gov/sites/default/files/2020-08/fema_dam-safety_glossary_P-148.pdf) and a brief description of each field on the [developer page](https://nid.sec.usace.army.mil/api/developer)  which also summarizes additional information available via API. The NID [data dictionary](https://usace-cwbi-prod-il2-nld2-docs.s3-us-gov-west-1.amazonaws.com/ec51e2ba-daff-4dbe-95eb-af13b91066ba/NID%20Data%20Dictionary%202021-12-14.pdf) was last updated in December 2021.
+
+I downloaded the [National Inventory of Dams](https://nid.sec.usace.army.mil/#/) on 2025-05-15.
+
+Notes: 
+
+* `latitude` and `longitude` are at dam centerline expressed as a single value in decimal degrees, NAD83.
+* "nid" in the name refers to a value created for this database. In many cases these are conveniences for analysis and plotting. For example, `nidHeight` combines is the "maximum value of dam height, structural height, and hydraulic height. Accepted as the general height of the dam".
+
+<br>
+
+<https://nid.sec.usace.army.mil/#/>
+
+National Inventory of Dams\
+More than 90,000 dams nation-wide
+
+> Disclaimer
+> You must agree to the following terms to continue to the site.
+> 
+> You are accessing a U.S. Government (USG) Information System (IS) that is provided for USG-authorized use only. By using this IS (which includes any device attached to this IS), you consent to the following conditions:
+> 
+> The USG routinely intercepts and monitors communications on this IS for purposes including, but not limited to, penetration testing, COMSEC monitoring, network operations and defense, personnel misconduct (PM), law enforcement (LE), and counterintelligence (CI) investigations. At any time, the USG may inspect and seize data stored on this IS. Communications using, or data stored on, this IS are not private, are subject to routine monitoring, interception, and search, and may be disclosed or used for any USG-authorized purpose. This IS includes security measures (e.g., authentication and access controls) to protect USG interests--not for your personal benefit or privacy.
+> 
+> Notwithstanding the above, using this IS does not constitute consent to PM, LE or CI investigative searching or monitoring of the content of privileged communications, or work product, related to personal representation or services by attorneys, psychotherapists, or clergy, and their assistants. Such communications and work product are private and confidential. See User Agreement for details.
+
+<https://nid.sec.usace.army.mil/#/downloads>
+
+Data last updated 2025-05-07 downloaded on 2025-05-15
+
+* nation.csv
+* nation.gpkg
+
+There is a brief description of each field at <https://nid.sec.usace.army.mil/api/developer> which also summarizes additional information available via API.
+
+> The National Inventory of Dams (NID) API is a complete, programmable interface to all NID functionality. The NID API is a RESTful web service, using standard technologies like HTTP verbs, headers, and status codes.
+> 
+> The NID website is built on this API, and all of its services are available for integration into your application. To get started, we recommend exploring the website to learn about the functionality that is available.
+> 
+> Currently, you can develop your application with the public API. If you need assistance, please email us at NID@usace.army.mil with any questions.
+
+See also <https://nid.sec.usace.army.mil/#/about-the-nid/data> and <https://nid.sec.usace.army.mil/#/about-the-nid/faq>
+
+Useful, simple overview: <https://nid.sec.usace.army.mil/#/dam-basics/what-is-a-dam>
+
+There is also a glossary of terms: <https://www.fema.gov/sites/default/files/2020-08/fema_dam-safety_glossary_P-148.pdf>
+
+National Inventory of Dams. Data Dictionary. December 2021 <https://usace-cwbi-prod-il2-nld2-docs.s3-us-gov-west-1.amazonaws.com/ec51e2ba-daff-4dbe-95eb-af13b91066ba/NID%20Data%20Dictionary%202021-12-14.pdf>
+
+Notes: 
+
+* `latitude` and `longitude` are at dam centerline expressed as a single value in decimal degrees, NAD83.
+* `volume` refers to the dam; `storage` refers to the capacity of the dam to store water.
+
+### Other sources of data
+
+See river and hydrology data at the end of this chapter and the list in Acknowledgements section of *@sec-intro Introduction*.
+
+<br>
+
+## Limitations
+
+* As in any large data set consisting of records provided by many parties over many years...
+
+  - There are some errors and inconsistencies in the data.
+  
+  - There are a lot of missing values for some fields. Very few records have data in every field.
+  
+  -  `primaryPurposeId` requires someone to pick one reason. Many dams were built for multiple reasons, or at least now serve multiple purposes. Views that look only at primary purpose may present a skewed view.
+
+```{r}
+#| label: define-update-freq
+
+dta_for_plot <- dams_no_geo |>
+  slice_max(order_by = dataUpdated,
+            n = 1,
+            with_ties = FALSE,
+            by = state_abb) |>
+  mutate(days_since_last_update = as.numeric(difftime(ymd("2025-05-15"), dataUpdated, "days"))) |>
+  arrange(days_since_last_update) |>
+  mutate(idx = row_number()) 
+  
+```
+
+  - This data set is subject to selection bias. Some state departments may be more diligent in recording information for small dams or have preferences in how categorize purpose or encode data in other fields.
+
+  - Data freshness: While it’s not obvious how often the states provide relevant updates to the NID, it is a good sign that the most recent update occurred only `r min(dta_for_plot$days_since_last_update)` days prior to my download, and half the states updated at least one record in the month before I downloaded it (@fig-nid-update-frequency panel B). The longest period since update by any state is `r max(dta_for_plot$days_since_last_update)` days. However, we don’t know for sure that all states provide updates when there is a relevant update–-or how long information may sit in government offices before being sent to the NID. All that said, given every state provided an update within the last `r max(dta_for_plot$days_since_last_update)` days, it seems to me that we can be confided that the data is actively and regularly updated.
+
+```{r}
+#| label: fig-nid-update-frequency
+#| fig-cap: "NID update frequency"
+#| fig-height: 6
+#| fig-width: 8
+##| column: page-right
+
+p1 <- dta_for_plot |>
+  ggplot() +
+  geom_histogram(aes(days_since_last_update),
+                 binwidth = 7) +
+  scale_y_continuous(breaks = 0:10 * 2,
+                     expand = expansion(mult = c(0, 0.04))) +
+  labs(
+    subtitle = "A: Histogram",
+    x = "Days",
+    y = "Count"
+  )
+
+p2 <- dta_for_plot |>
+  ggplot() +
+  stat_ecdf(aes(days_since_last_update),
+            linewidth = 0.5,
+            color = "steelblue") +
+  scale_y_continuous(labels = label_percent(),
+                     expand = expansion(mult = c(0, 0.04))) +
+  labs(
+    subtitle = "B: Cumulative distribution",
+    x = "Days",
+    y = "Percent of states in continental USA"
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title ="States' days since last update to NID", 
+    subtitle =  glue("Prior to my download on {nid_download_date}"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+## TODOs and questions
+
+* DONE: remove stuff in prepare-data.R that is no longer used
+
+* DONE: Decide whether to keep RMSE in ruggedness.qmd - removed it.
+
+* DONE: Add commentary above plots that lack it.
+
+* DONE: Confirm auto-dark is working OK. Including: should I stay with SVGs or move pack to PNGs? The SVGs are much bigger. I went back to cosmo theme + plots as PNGs
+
+* DONE: confirm "Michigan corrected" wherever `surfaceArea` and `nidStorage` are used
+
+* DONE: Resolve remaining "TODO' statements in markup (not in code blocks--leave them)
+
+* DONE: Ensure captions have the right data sources
+
+* STARTED: Remove "processed" files no longer needed
+
+* TODO: Remove "raw" files not used
+
+* TODO: Push to GH
+
+* TODO: Render to GH Pages
+
+
+### Exclude ancillary dam features. I only want "every main dam".
+
+Exclude any record with a value in `otherStructureID`. Data exists in this field only for structures other than the main dams.
+
+### Exclude dikes and levees
+
+* DONE: Multiple dikes and levees around the same water feature all "claim" the water, inflating the `nidStorage`, `surfaceArea`, etc. See examples in @tbl-largest-surfaceArea-raw-dataset below. Since I'm only interested in dams, I exclude them by removing all rows of data that include "[Dd]ike" if not accompanied by "[Dd]am". This removes about 14K rows (92K to 78K)
+
+    ```
+    filter(!(str_detect(name, "[Ddike]") & !str_detect(name, "[Dam]"))) |> # no dikes period unless with dam
+    ```
+  
+  - There are other cases of duplicate accounting, for example the following:
+    
+    ```
+    nidId "OH00581", # Grand Lake St. Marys - East Embankment in Ohio (duplicate surface area with West Embankment)
+    nidId "WA00266" # North Dam; same surface area and nidStorage as Dry Falls Dam
+    ```
+
+### Address other special cases creating outliers
+
+* DONE: Remove outliers when it makes sense do to so (especially related to `nidStorage` and `surfaceArea`).
+
+  - The most egregious case is the modest [MI00650 Soo Locks](https://nid.sec.usace.army.mil/nid/#/dams/system/MI00650/summary) which "claims" a large portion of the water of Lake Superior as discussed in *@sec-explore-numbers Numbers*. 
+
+```{r}
+#| label: tbl-largest-surfaceArea-raw-dataset
+#| tbl-cap-location: bottom
+#| tbl-cap: "Top 20 NID records with largest surfaceArea"
+
+dams_all |>
+  st_drop_geometry() |>
+  slice_max(order_by = surfaceArea, n = 20) |>
+  arrange(desc(surfaceArea)) |>
+  select(state, name, nidId, surfaceArea, nidStorage) |>
+  gt() |>
+  tab_header(md("**Top 20 NID records with largest surfaceArea**")) |>
+  tab_source_note(md("*Source: National Inventory of Dams. Table: Daniel Moul*")) |>
+  fmt_number(columns = c(surfaceArea, nidStorage),
+             decimals = 0)
+
+```
+
+
+## NID data column detais
+
+The NID's nation.gpkg file has more than 91K rows of data. After partial cleaning and converting appropriate columns from character to numeric type, variables can be grouped by Date, character and numeric type.
+
+```{r}
+dta_for_skimr_table <- dams_all |>
+  st_drop_geometry() |>
+  skimr::skim() |>
+  select(-c(character.empty, character.whitespace)) |>
+  mutate(idx = row_number()) |>
+  relocate(idx)
+
+dta_for_skimr_table |>
+  select(idx:complete_rate, starts_with("Date")) |>
+  filter(skim_type == "Date") |>
+  gt() |>
+  tab_options(table.font.size = 10) |>
+  tab_header(md("**Date data in the `dams_all` dataframe**")) |>
+  fmt_number(columns = c(n_missing, starts_with(c("numeric", "character"))),
+             decimals = 0) |>
+  fmt_percent(columns = complete_rate,
+              decimals = 0) |>
+  sub_missing()
+
+```
+
+```{r}
+dta_for_skimr_table |>
+  select(idx:complete_rate, starts_with("character")) |>
+  filter(skim_type == "character") |>
+  gt() |>
+  tab_options(table.font.size = 10) |>
+  tab_header(md("**Character data in the `dams_all` dataframe**")) |>
+  fmt_number(columns = c(n_missing, starts_with(c("numeric", "character"))),
+             decimals = 0) |>
+  fmt_percent(columns = complete_rate,
+              decimals = 0) |>
+  sub_missing()
+
+```
+
+```{r}
+dta_for_skimr_table |>
+  select(idx:complete_rate, starts_with("numeric")) |>
+  filter(skim_type == "numeric") |>
+  gt() |>
+  tab_options(table.font.size = 10) |>
+  tab_header(md("**Numeric data in the `dams_all` dataframe after converting sutable data columns to numeric type**")) |>
+  fmt_number(columns = c(n_missing, starts_with(c("numeric", "character"))),
+             decimals = 0) |>
+  fmt_percent(columns = complete_rate,
+              decimals = 0) |>
+  sub_missing()
+
+```
+
+<br>
+
+### Dams working set
+
+I did further cleaning to arrive at a working data set called `dams`
+
+```{r}
+dams |>
+  # select(idx:complete_rate, starts_with("numeric")) |>
+  # filter(skim_type == "numeric") |>
+  st_drop_geometry() |>
+  skimr::skim() |>
+  arrange(skim_type, skim_variable) |>
+  mutate(idx = row_number()) |>
+  relocate(idx) |>
+  gt() |>
+  tab_options(table.font.size = 10) |>
+  tab_header(md("**`Dams` working data set**")) |>
+  fmt_number(columns = c(n_missing, starts_with(c("numeric", "character"))),
+             decimals = 0) |>
+  fmt_percent(columns = complete_rate,
+              decimals = 0) |>
+  sub_missing()
+```
+
+<br>
+
+### NID data I chose not to use
+
+The NID data includes `damLength`, however I don't use it due to the variable nature of what it includes:
+
+* `damLength`: Length of the dam, in feet, which is defined as the length along the top of the dam. This also includes the
+spillway, powerplant, navigation lock, fish pass, etc., where these form part of the length of the dam. If
+detached from the dam, these structures should not be included.
+
+Nor do I use `volume`, since in the NID this refers to the volume of the dam, not the water behind the dam:
+
+* `volume`: The total space occupied by the materials forming the dam structure computed between abutments and from top to bottom of dam. No deduction is made for small openings such as galleries, adits, tunnels, and operating chambers within the dam structure. Portions of powerplants, locks, spillway, etc., should be included only if they are necessary for the structural stability of the dam.
+
+
+## River shapefiles available from the NWS
+
+https://www.weather.gov/gis/Rivers
+
+Source: National Weather Service National Operational Hydrologic Remote Sensing Center https://www.nohrsc.noaa.gov/gisdatasets/ The NOHRSC provides and maintains the NWS Integrated Hydrologic Automated Basin Boundary System (IHABBS) GIS database to support river and flood forecasting throughout the nation. Basin boundary data sets and RFC boundaries are provided here in shapefiles that have been tarred and gzipped.
+
+* <https://www.nohrsc.noaa.gov/gisdatasets/> includes many curated shapefiles.
+
+## National Hydrology Dataset - USGS
+
+This provides the detailed stream-level data for the area around Bad River, SD. --Daniel
+
+* <https://www.usgs.gov/national-hydrography/national-hydrography-dataset>
+
+
+USGS National Hydrology Database
+
+* <https://www.sciencebase.gov/catalog/item/5d30c27ee4b01d82ce84a9b3>
+
+* <https://www.sciencebase.gov/catalog/item/5d30c27fe4b01d82ce84a9bb>
+
+* <https://www.sciencebase.gov/catalog/item/5d30c27ee4b01d82ce84a9b5>
+
+* <https://www.sciencebase.gov/catalog/item/5d30c27ee4b01d82ce84a9b1>
+
+* <https://www.sciencebase.gov/catalog/item/5d30c27ee4b01d82ce84a9af>
+
+* <https://www.sciencebase.gov/catalog/item/5d30c27ee4b01d82ce84a9ad>
+
+* <https://www.usgs.gov/media/files/national-hydrography-dataset-nhd-data-model-v231>
+
+* <https://www.usgs.gov/ngp-standards-and-specifications/national-hydrography-dataset-nhd-data-dictionary-0>
+
+* <https://www.usgs.gov/ngp-standards-and-specifications/national-hydrography-dataset-nhd-data-dictionary-feature-classes>
+
+NHDFlowline FType (Feature type) 
+
+* 460: StreamRiver
+* 336 CanalDitch
+
+NHDArea FType
+
+* 460: StreamRiver
+* 336" CanalDitch
+* 343: DamWeir
+* 484 Wash (dry portion of stream bed that contains water only during/after rainfall)
+
+NHDWaterbody FType
+
+* 390: LakePond
+* 436: Reservoir
+
+
+I downloaded South Dakota state-level data from 
+
+* <https://www.usgs.gov/national-hydrography/access-national-hydrography-products> 
+* download by state: <https://prd-tnm.s3.amazonaws.com/index.html?prefix=StagedProducts/Hydrography/NHD/State/GDB/>
+
+<br>

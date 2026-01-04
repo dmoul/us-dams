@@ -1,0 +1,253 @@
+# Risks {#sec-risks}
+
+```{r}
+#| label: setup
+#| include: false
+
+source(here::here("scripts/setup.R"))
+
+source(here::here("scripts/prepare-data.R"))
+
+```
+
+A primary reason for the National Inventory of Dams is to ensure that risks related to dams are adequately identified and managed.
+
+The NID data dictionary defines the hazard classifications:
+
+> Hazard Potential Classification
+> Category to indicate the potential hazard to the downstream area resulting from failure or mis-operation of the
+dam or facilities. It reflects probable loss of human life and impacts on economic, environmental, and lifeline
+interests. The hazard potential does not speak to the condition of the dam or the risk of the dam failing.
+>
+> * Low, Significant, High
+> * Undetermined, Not Available [not in our data set]
+
+> Definitions, as accepted by the Interagency Committee on Dam Safety, are as follows:
+>
+> * Low Hazard Potential: Dams assigned the low hazard potential classification are those where failure or mis-operation results in no
+probable loss of human life and low economic and/or environmental losses. Losses are principally limited to the owner’s property.
+> * Significant Hazard Potential: Dams assigned the significant hazard potential classification are those dams where failure or mis-operation results in no probable loss of human life but can cause economic loss, environment damage, disruption of
+lifeline facilities, or impact other concerns. Significant hazard potential classification dams are often located in
+predominantly rural or agricultural areas but could be in areas with population and significant infrastructure.
+> * High Hazard Potential: Dams assigned the high hazard potential classification are those where failure or mis-operation will probably cause loss of human life.
+
+<br>
+
+## Dam condition
+
+```{r}
+#| label: fig-dams-hazard-condition-plots
+#| fig-cap: "Dam hazard levels and condition assessment (continental states)"
+#| fig-height: 6
+#| fig-width: 10
+#| column: page-right
+
+dta_for_plot <- dams_no_geo |>
+  count(hazardId, conditionAssessId)
+
+p1 <- dta_for_plot |>
+  ggplot() +
+  geom_col(aes(n, hazardId, fill = conditionAssessId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  labs(
+    subtitle = "Hazard level by condition status",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- dta_for_plot |>
+  ggplot() +
+  geom_col(aes(n, conditionAssessId, fill = hazardId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  labs(
+    subtitle = "Condition status by hazard level",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "Hazard level by condition status",
+    caption = my_caption
+  )
+
+```
+
+<br> 
+
+Very few are rated "Unsatisfactory"
+
+```{r}
+#| label: fig-dams-hazard-condition
+#| fig-cap: "Dam hazard levels and condition assessment (continental states)"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+# unsat <- dams_no_geo |>
+#   filter(conditionAssessId == "Unsatisfactory") |>
+#   count(nidHeightId)
+# 
+# poor <- dams_no_geo |>
+#   filter(conditionAssessId == "Poor") |>
+#   count(nidHeightId)
+
+dams_no_geo |>
+  count(hazardId, conditionAssessId, nidHeightId) |>
+  ggplot() +
+  geom_col(aes(n, hazardId, fill = conditionAssessId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  facet_wrap(~nidHeightId) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.8, 0.3)) +
+  labs(
+    title = "Dam hazard levels and condition assessment\nby dam height",
+    x = NULL,
+    y = NULL,
+    caption = my_caption
+  )
+
+dams_no_geo |>
+  count(hazardId, conditionAssessId, nidHeightId) |>
+  ggplot() +
+  geom_col(aes(n, hazardId, fill = nidHeightId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  facet_wrap(~conditionAssessId) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.8, 0.3)) +
+  labs(
+    title = "Dam hazard levels and condition assessment\nby dam height",
+    x = NULL,
+    y = NULL,
+    caption = my_caption
+  )
+
+dams_no_geo |>
+  filter(conditionAssessId %in% c("Unsatisfactory", "Poor", "Fair")) |>
+  count(hazardId, conditionAssessId, nidHeightId) |>
+  ggplot() +
+  geom_col(aes(n, hazardId, fill = nidHeightId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  facet_wrap(~conditionAssessId, ncol = 2) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.8, 0.3)) +
+  labs(
+    title = "Dam hazard levels and condition assessment\nby dam height",
+    x = NULL,
+    y = NULL,
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+Big dams with Unsatisfactory or Poor condition:
+
+```{r}
+#| label: fig-dams-hazard-condition-bad
+#| fig-cap: "High hazard levels and unsatisfactory or poor condition"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+dta_for_plot <- dams_no_geo |>
+  filter(conditionAssessId %in% c("Unsatisfactory", "Poor"),
+         big_dam) |>
+  count(hazardId, conditionAssessId, nidHeightId)
+
+n_dams_big_unsat_poor = sum(dta_for_plot$n)
+
+dta_for_plot |>
+  ggplot() +
+  geom_col(aes(n, hazardId, fill = nidHeightId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  facet_wrap(~conditionAssessId, ncol = 2) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.8, 0.3)) +
+  labs(
+    title = glue("{n_dams_big_unsat_poor} big dams have assessment\nof Unsatisfactory or Poor"),
+    x = NULL,
+    y = "HazardId",
+    caption = my_caption
+  )
+```
+
+<br>
+
+Most risky: over 100 ft, high hazard level, and unsatisfactory rating:
+
+```{r}
+#| label: tbl-dams-hazard-condition-bad
+#| tbl-cap: "Short list: High hazard level and unsatisfactory condition"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+dams_no_geo |>
+  filter(hazardId == "High",
+         conditionAssessId == "Unsatisfactory",
+         nidHeightId == "Greater than 100 feet") |>
+  select(name, nidId, state, primaryPurposeId, nidHeight, nidStorage, hazardId, conditionAssessDate, eapId, eapLastRevDate, ownerNames) |>
+  arrange(desc(nidStorage)) |>
+  mutate(idx = row_number()) |>
+  relocate(idx) |>
+  gt() |>
+  tab_options(table.font.size = 10) |>
+  tab_header(md("**Big dams with high hazard level and unsatisfactory condition**"))
+
+```
+
+<br>
+
+## Dams for which an EAP is mandated
+
+> Emergency Action Plan (EAP Prepared)
+> Indicating whether this dam has an Emergency Action Plan (EAP) developed by the dam owner. An EAP is defined as a plan of action to be taken to reduce the potential for property damage and loss of life in an area affected by a dam failure or large flood.
+> 
+> * Yes
+> * No
+> * Not Required (by regulatory agency)
+> 
+> If an EAP is required (or not required) and has one, it will be listed as Yes. If an EAP is required and does not have one, it will be listed as No. If there is not an EAP and one is not required, it will be listed as Not Required.^[NID data dictionary]
+
+```{r}
+dta_for_plot <- dams_no_geo |>
+  count(hazardId, eapId)
+
+dta_for_plot |>
+  ggplot() +
+  geom_col(aes(n, hazardId, fill = eapId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    title = "Hazard level: count by\nemergency action plan (EAP) status",
+    x = NULL,
+    y = NULL,
+    caption = my_caption
+    
+  )
+
+```
+
+```{r}
+#| label: tbl-hazard-breakdown
+#| tbl-cap-location: bottom
+#| tbl-cap: "Dam hazard level and Emergency Action Plan"
+
+dams_no_geo |>
+  count(hazardId, eapId) |>
+  mutate(prop_of_hazardId = n / sum(n),
+         .by = hazardId) |>
+  filter(eapId %in% c("Yes", "No")) |>
+  gt() |>
+  tab_header(md("**Dam hazard level and Emergency Action Plan**")) |>
+  fmt_percent(columns = prop_of_hazardId,
+              decimals = 0) |>
+  cols_align(columns = c(hazardId, eapId),
+             align = "left")
+
+```
+
+<br>

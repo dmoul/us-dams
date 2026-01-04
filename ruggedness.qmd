@@ -1,0 +1,2687 @@
+# Terrain ruggedness {#sec-ruggedness}
+
+```{r}
+#| label: setup
+#| include: false
+
+source(here::here("scripts/setup.R"))
+source(here::here("scripts/prepare-data.R"))
+
+library(here)
+library(fs)
+library(elevatr)
+library(terra)
+library(tidyterra)
+library(USAboundaries)
+
+# these are also used in ruggedness-preparing.qmd
+state_tri_circle_samples_pname <- here("data/processed/state-circle-tri-samples-zoom9")
+state_dam_tri_summary_pname <- here("data/processed/state-dam-tri-summary-zoom9")
+
+get_rmse <- function(v) {
+  # INPUT: vector of residuals, e.g from `residuals(mod)`
+  # Output: one real number
+  
+  round(sqrt(sum(v^2)), digits = 1)
+}
+
+
+```
+
+```{r}
+#| label: get-state-boundaries
+
+state_boundaries_sf <- us_states() |>
+  # `dams` data uses `state_abb` rather than 'state_abbr`, which `dam` gets from R's built-in `state.abb` data frame.
+  # next 3 lines are a workaround since "rename(state_abb = state_abbr)" doesn't work
+  #   "Error in rename.sf(us_states(), state_abb = state_abbr) : internal error: can't find `agr` columns"
+  mutate(state_abb = state_abbr) |>
+  relocate(state_abb, .after = state_abbr) |>
+  select(-state_abbr) |>
+  filter(!state_abb %in% c("DC", "HI", "AK", "PR")) |>
+  arrange(state_abb) |>
+  st_transform("NAD83") # US Government standard CRS
+
+nc_boundary <- state_boundaries_sf |>
+  filter(state_abb == "NC")
+
+```
+
+```{r}
+#| label: confirm-data-sets-are-ready
+#| eval: false
+
+###### Does dam TRI data exist?
+
+states_with_dams <- sort(unique(dams$state_abb))
+
+for(i in seq_len(length(states_with_dams))) {
+  
+  state_dam_tri_summary_fname <- paste0(state_dam_tri_summary_pname, "/", states_with_dams[i], ".rds")
+  
+  if(!file.exists(state_dam_tri_summary_fname)) {
+    
+    errorCondition(
+      glue("This chapter ('ruggedness.qmd') needs dam terrain ruggedness (TRI) data created in the 'Exploring ruggedness' chapter.", 
+    "\nRerender this chapter after rendering that chapter (from a terminal command line: 'quarto render ruggedness-exploring.qmd')",
+    "\nAfter doing that files will exist for each continental state similar to\n{state_dam_tri_summary_fname}"
+      )
+    )
+    
+    knitr::knit_exit()
+    
+  }
+}
+
+###### Does state sample TRI data exist?
+
+states_with_points <- states_with_dams
+
+for(i in seq_len(length(states_with_points))) {
+  
+  state_tri_circle_samples_fname <- paste0(state_tri_circle_samples_pname, "/", states_with_points[i], ".rds")
+  
+  if(!file.exists(state_tri_circle_samples_fname)) {
+    
+    errorCondition(
+      glue("This chapter ('ruggedness.qmd') needs state sample terrain ruggedness (TRI) data created in the 'Exploring ruggedness' chapter.", 
+    "\nRerender this chapter after rendering that chapter (from a terminal command line: 'quarto render ruggedness-exploring.qmd').",
+    "\nAfter doing that files will exist for each continental state similar to\n{state_tri_circle_samples_fname}",
+    "\nThen you can rerender 'ruggedness.qmd' from a terminal command line: 'quarto render' or 'quarto rend ruggedness.qmd')."
+      )
+    )
+    
+    knitr::knit_exit()
+    
+  }
+}
+
+
+```
+
+```{r}
+#| label: get-tri-data-etc
+
+states_with_dams <- sort(unique(dams$state_abb))
+n_states_with_dams <- length(states_with_dams)
+
+states_and_regions <- tibble(
+  state_region = state.region,
+  state_abb = state.abb) |>
+  filter(state_abb %in% states_with_dams) |>
+  mutate(n_states = n(),
+         region_label = glue("{state_region} (n={n_states})"),
+         .by = state_region)
+
+###### Get state samples TRI data
+
+state_samples_tri_summary_df <- map(dir(state_tri_circle_samples_pname, full.names = TRUE), 
+                                    read_rds) |>
+  bind_rows() |>
+  left_join(
+    states_and_regions,
+    by = "state_abb"
+  ) |>
+  rename(tri_n_sample = tri_n,
+         tri_mean_sample = tri_mean,
+         tri_median_sample = tri_median,
+         tri_sd_sample = tri_sd)
+
+
+###### Get dam TRI data
+
+# state_dam_tri_summary_fname <- paste0(state_dam_tri_summary_pname, "/", states_with_dams[i], ".rds")
+
+state_dam_tri_summary_df <- map(dir(state_dam_tri_summary_pname, full.names = TRUE), 
+             read_rds) |>
+  bind_rows() |>
+  left_join(
+    states_and_regions,
+    by = "state_abb"
+  ) |>
+  rename(tri_n_dam = tri_n,
+         tri_mean_dam = tri_mean,
+         tri_median_dam = tri_median,
+         tri_sd_dam = tri_sd)
+
+dams_with_tri <- dams |>
+  inner_join(state_dam_tri_summary_df |>
+               select(-c(state_region:region_label)),
+             by = join_by(nidId, state_abb)) |>
+  filter(nidHeightId != "Undetermined")
+
+n_dams_with_tri <- state_dam_tri_summary_df |>
+  nrow()
+
+min_tri_n_dam_state <- count(state_dam_tri_summary_df, state_abb, wt = tri_n_dam) |>
+  filter(min(n) == n)
+
+min_dams_n_state <- count(state_dam_tri_summary_df, state_abb) |>
+  filter(min(n) == n)
+
+max_dams_n_state <- count(state_dam_tri_summary_df, state_abb) |>
+  filter(max(n) == n)
+
+
+###### Get Blue Ridge Parkway multiline
+
+fname <- here("data/processed/blue-ridge-parkway.rds")
+if(!file.exists(fname)) {
+  
+  results <- st_bbox(nc_boundary) |>
+    opq() %>%
+    add_osm_feature(key = "name", 
+                    value = "Blue Ridge Parkway") %>%
+    osmdata_sf()
+  
+  parkway_lines <- results$osm_multilines |>
+    st_transform("NAD83")
+  
+  parkway_lines_nc <- st_intersection(parkway_lines, nc_boundary)
+  
+  write_rds(parkway_lines_nc, fname)
+  
+} else {
+  
+  parkway_lines_nc <- read_rds(fname)
+  
+}
+
+```
+
+## Hypotheses related to dams and ruggedness
+
+After thinking about the question I asked in *@sec-ratios Ratios* and how I might answer it:
+
+> Dams built in hilly areas seem to me to be more likely to have low ratios of surfaceArea to nidStorage, i.e., the dams are likely to be deeper rather than broader. Can we substantiate or disprove this conjecture?
+
+I've thought of three more specific hypotheses I want to explore ($H_2$ and $H_3$ are variants addressing the original question).
+
+### Hypothesis 1 {#sec-h1}
+
+> Local terrain ruggedness in the area around dams is greater than the ruggedness of areas around randomly sampled points in the continental US states. 
+
+In other words, for states:
+
+$$tri\_mean_{dam} \gt tri\_mean_{sample}$$
+In addition to plots exploring distributions and relationships, I look at four regressions:
+
+1. mod.h1.1: lm(tri_mean_dam ~ tri_mean_sample)
+
+  - If $H_1$ is true, the regression term estimate for $tri\_mean_{sample}$ will be positive. this is a necessary but not sufficient condition for $H_1$.
+
+2. mod.h1.2: lmer(tri_mean_dam ~ (1 | state))
+
+  - How much variation in $tri\_mean_{dam}$ can be explained by state effects without consideration of $tri\_mean_{sample}$? This provides a base from which to consider other models.
+
+3. mod.h1.3: lmer(tri_mean_sample ~ (1 | state))
+
+  - How much variation in $tri\_mean_{sample}$ can be explained by state effects without consideration of $tri\_mean_{dam}$? This provides a base from which to consider other models.
+
+4. mod.h1.4: lmer(tri_mean_dam ~ tri_mean_sample + (1 | state))
+
+  - I assume this model explains the more of the variance than the others.
+
+<br>
+
+### Hypothesis 2 {#sec-h2}
+
+> In states with higher terrain ruggedness, dams' $\frac{surfaceArea}{nidStorage}$ will be lower. 
+
+Where dams are in more rugged states, it seems likely dams' lakes will be deeper and thus have smaller ratios $\frac{surfaceArea}{nidStorage}$. In other words, considering the states in the continental US, there is an inverse proportional relationship:
+
+$$tri\_mean_{sample} \propto \frac{1}{\left(\frac{surfaceArea}{nidStorage}\right)}$$
+ 
+
+In addition to plots exploring distributions and relationships, I look at two regressions:
+
+1. lm(tri_mean_sample ~ ratio)
+2. lmer(tri_mean_sample ~ ratio + (1 | state))
+
+where $ratio = \frac{surfaceArea}{nidStorage}$.
+
+### Hypothesis 3 {#sec-h3}
+
+> Compared to H<sub>2</sub> there is a stronger inverse proportional relationship between ruggeness in the local areas around dams and surfaceArea::nidStorage
+
+In $H_3$ I restrict the locations to the local areas around dams. It's likely there is a stronger inverse proportional relationship between $tri\_mean_{dam}$ and $\frac{surfaceArea}{nidStorage}$ for the same dam, since dams are built where the topography provides good places to hold water.^[And in the case of dams for mine tailings and waste products from coal-based electricity generation: other liquids and semi-liquids.] 
+
+Expressed like $H_2$ :
+
+$$tri\_mean_{dam} \propto \frac{1}{\left(\frac{surfaceArea}{nidStorage}\right)}$$
+
+In addition to plots exploring distributions and relationships, I look at two regressions:
+
+1. lm(tri_mean_dam ~ ratio)
+2. lmer(tri_mean_dam ~ ratio + (1 | state))
+
+<br>
+
+## Methodology
+
+### Key metric
+
+I calculate terrain ruggedness index (TRI) from digital elevation model (DEM) data I downloaded and saved in GeoTIFF files. The [terra::terrain()](https://rspatial.github.io/terra/reference/terrain.html) function calculates TRI for me from the elevation data using eight-neighbor "classic" TRI per Wilson et al. (2007).^[Wilson et al 2007, Multiscale Terrain Analysis of Multibeam Bathymetry Data for Habitat Mapping on the Continental Slope. Marine Geodesy 30:3-35. See also the original paper defining TRI by Riley, DeGloia, and Elliot (1999): A Terrain Ruggedness Index that Quantifies Topographic Heterogeneity. Authors: Shawn J. Riley, Stephen D. DeGloria, Robert Elliot. *Intermountain Journal of Sciences*, Vol. 5, No. 1-4, 1999. <https://arc.lib.montana.edu/ojs/index.php/IJS/article/view/1794/1457> which is available for download from the Archives and Special Collections of Montana State University.] 
+
+From the `terra::terrain()` help: 
+
+> "TRI (Terrain Ruggedness Index) is the mean of the absolute differences between the value of a cell and its 8 surrounding cells." 
+
+Note that TRI values are sensitive to the resolution of the digital elevation model, since differences in elevation differ significantly over various distances.
+
+### Data sources
+
+I get elevation data from [elevatr::get_elev_raster()](https://cran.r-project.org/web/packages/elevatr/refman/elevatr.html#get_elev_raster), which returns Shuttle Radar Topography Mission (SRTM)^[<https://www.earthdata.nasa.gov/data/instruments/srtm> ] data via [Open Topography](https://opentopography.org). The SRTM's Digital Elevation Model (DEM) is a Digital Surface Model (DSM) rather than a Digital Terrain Model (DTM). In other words, the radar reflections used to calculate elevations in some cases are from the tops of buildings and partway through the tree canopy; elevation values have not been adjusted to estimate ground level.^[See <https://geoservice.dlr.de/web/dataguide/srtm/> and <https://gis.stackexchange.com/questions/110755/is-srtm-3-second-arc-free-of-non-terrain-features> ] For my purposes, and because I have so many points to work with, this noise is not an issue.
+
+The SRTM digital elevation model (DEM) has a range over continental North America south of 60° N latitude. This range is fine, since the northernmost point in the continental USA is the Northwest Angle Inlet in Lake of the Woods, MN at 49.4°).^[<https://en.wikipedia.org/wiki/List_of_extreme_points_of_the_United_States> ]
+
+I use zoom level 9 (`elevatr::get_elev_raster(z = 9)`), which provides data at the resolution of about 125 m per point in North Carolina and greater distances between points in lower latitudes. For more information see *@sec-res-by-latitude Resolution of elevation data varies by latitude*.
+
+For state boundaries, I use [USAboundaries::us_states()](https://ropensci.r-universe.dev/USAboundaries) 
+
+For drawing the Blue Ridge Parkway in North Carolina, I use shapes from OpenStreetMap, which I acquire via the [osmdata](https://ropensci.r-universe.dev/osmdata) package.
+
+### Data prep
+
+1. **Dam data**: Using data the from the National Inventory of Dams, I prepare a data set with `r n_dams` dams that include `nidHeightId` (and thus `nidHeight`) along with state abbreviation (`state_abb`) and $(longitude, latitude)$ location.
+
+2. **State boundaries, etc.**: I use [USAboundaries::us_states()](https://ropensci.r-universe.dev/USAboundaries) to get state boundaries and use [osmdata::opq()](https://ropensci.r-universe.dev/osmdata) to download OpenStreetMap shapes for the Blue Ridge Parkway in North Carolina. 
+
+3. **State-level elevation data**: Using state boundaries, I downloaded DEM and saved them as GeoTIFF files for use in the following steps.
+
+4. **Local terrain ruggedness around dams**: I define a circle of radius r = 5 km around each dam location, get the elevations for every point in the circle, and calculate the TRI for the points. Then I create summary statistics for each dam's circle (`tri_mean_dam`, `tri_median_dam`, `tri_sd_dam`, `tri_n_dam` points).
+
+5. **Local terrain ruggedness around random points**: The number of dams vary by state. So for each state, I randomly sample the same number of points as there are dams in that state, define circles of radius r = 5 km, get the elevations for every point in the circle, and calculate the TRI for the points. Then I create summary statistics for each sample's circle (`tri_mean_sample`, `tri_median_sample`, `tri_sd_sample`, `tri_n_sample` points).
+
+For more information about data preparation, questions I asked, and trade-offs I made along the way, see *@sec-ruggedness-preparing Preparing terrain ruggedness*.
+
+### Exploration
+
+To explore $H_1:$ in *@sec-h1-explore*:
+
+  - I plot the distribution of $tri\_mean_{dam}$ and $tri\_mean_{sample}$ by `state_abb`, `state_region`, and `nidHeightId`.
+  
+  - I sort the dam and state samples in order of $tri\_mean_{dam}$ and $tri\_mean_{sample}$ respectively, and I pair them in linear regressions with various models to check which models explain the most variance. I plot some of the model parameter (a.k.a. term) estimates. 
+
+To explore $H_2:$in *@sec-h2-explore*:
+
+  - I plot the distributions of $surfaceArea$, $nidStorage$, and $\frac{surfaceArea}{nidStorage}$ aggregated by `state_abb` and `nidHeigthId`.
+
+  - I sort the dam and state samples in order of $tri\_mean_{dam}$ and $tri\_mean_{sample}$ respectively, and I pair them in linear regressions predicting $tri\_mean_{sample}$ using various models to check which models explain the most variance.
+
+To explore $H_3:$in *@sec-h3-explore*:
+
+  - I plot the distributions of $surfaceArea$, $nidStorage$, and $\frac{surfaceArea}{nidStorage}$ aggregated by `state_abb` and `nidHeigthId`.
+
+  - I use the same data set as in $H_2$ and run linear regressions predicting $tri\_mean_{dam}$ using various models to check which models explain the most variance.
+
+<br>
+ 
+## Exploring H<sub>1</sub> : Local terrain ruggedness in the area around dams is greater than the ruggedness of areas around randomly sampled points in the contentinental US states {#sec-h1-explore}
+
+The area around a dam has greater terrain ruggedness than its paired state sample if 
+
+$$tri\_mean_{dam} - tri\_mean_{sample} > 0$$
+
+When the differences in $tri\_mean_{dam}$ and $tri\_mean_{sample}$ are aggregated by state, region, or other property, their distributions and differences in distribution medians allow us to make some generalizations:
+
+$${median(tri\_mean_{dam} - tri\_mean_{sample})} > 0$$
+
+for some aggregation.
+
+### First: dam and sample distributions
+
+Of note re: @fig-dam-local-area-tri-summary-density-by-state:
+
+1. There is a lot of variation in the distributions and median tri_means of $tri\_mean_{dam}$ and $tri\_mean_{sample}$ by state. And I didn't expect West Virginia to have the highest median $tri\_mean_{sample}$.
+
+2. While there are states that have high median $tri\_mean_{dam}$ for the local areas around some dams, there is no concentration in the distributions at these higher values. Ruggedness varies a lot more than flatness.
+
+3. There is wide variation in number of points in each state, proportional to the number of dams in the state. `r min_tri_n_dam_state$state_abb` has the fewest points: `r comma(min_tri_n_dam_state$n)`, which is more than enough for my purposes.
+
+```{r}
+#| label: fig-dam-local-area-tri-summary-density-by-state
+#| fig-cap: "Distributions of tri_mean<sub>dam</sub> in areas around dams in each state"
+#| fig-width: 8
+#| fig-height: 10
+#| column: page-right
+
+dta_for_plot <- state_dam_tri_summary_df |>
+  mutate(state_mean_dam = weighted.mean(tri_mean_dam, w = tri_n_dam),
+         state_median_dam = median(tri_mean_dam),
+         .by = c(state_abb, state_region, region_label)) |>
+  mutate(state_abb = fct_reorder(state_abb, state_median_dam))
+
+p1_dam_state <- dta_for_plot |>
+  ggplot() +
+  geom_density_ridges(
+    aes(tri_mean_dam, state_abb, fill = region_label),
+    rel_min_height = 0.005,
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = state_dam_tri_summary_df |>
+      mutate(
+        state_mean_dam = weighted.mean(tri_mean_dam, w = tri_n_dam),
+        state_median_dam = median(tri_mean_dam),
+        .by = state_abb
+      ) |>
+      distinct(state_abb, state_median_dam),
+    aes(state_median_dam, state_abb, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.75, 0.2)) +
+  coord_cartesian(xlim = c(0, 28)) +
+  labs(
+    subtitle = "A. Distribution of tri_mean<sub>dam</sub><br>",
+    y = NULL
+  )
+
+p2 <- dta_for_plot |>
+  ggplot() +
+  geom_col(
+    aes(tri_n_dam, state_abb, fill = region_label),
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") +
+  labs(
+    subtitle = "B. Number of TRI values<br>",
+    y = NULL
+  )
+
+p1_dam_state + p2 +
+  plot_annotation(
+    title = "Distribution of *tri_mean<sub>dam</sub>* for local areas around dams",
+    subtitle = "Red indicator is median tri_mean<sub>dam</sub><br>",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: @fig-dam-local-area-tri-summary-density-non-state
+
+* The Northeast and West regions have the highest median $tri\_mean_{dam}$ (panel A).
+
+* The median $tri\_mean_{dam}$ is higher for every higher category of `nidHeightId` (panel B).
+
+```{r}
+#| label: fig-dam-local-area-tri-summary-density-non-state
+#| fig-cap: "Distribution of tri_mean<sub>dam</sub> of areas around dams by nidHeightId and region"
+#| fig-width: 8
+#| fig-height: 8
+#| column: page-right
+
+dta_for_plot <- state_dam_tri_summary_df |>
+  mutate(region_mean_dam = weighted.mean(tri_mean_dam, w = tri_n_dam),
+         region_median_dam = median(tri_mean_dam),
+         .by = c(region_label))
+
+dta_for_plot_p1_region_medians <- dta_for_plot |>
+  distinct(region_label, .keep_all = TRUE)
+
+p1_dam_region <- dta_for_plot |>
+  ggplot() +
+  geom_density(
+    aes(tri_mean_dam, fill = region_label),
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = dta_for_plot_p1_region_medians,
+    aes(region_median_dam, 0, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  geom_text(
+    data = dta_for_plot_p1_region_medians,
+    aes(x= I(0.7), y = I(0.8), 
+        label = glue("Median: {round(region_median_dam, digits = 1)}")
+        )
+  ) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") +
+  facet_wrap(~region_label, ncol = 1) +
+  coord_cartesian(xlim = c(0, 55)) +
+  labs(
+    subtitle = "A. Distribution of tri_mean<sub>dam</sub>\nby region<br>",
+    y = NULL
+  )
+
+dta_for_plot_p2 <- dams_with_tri |>
+  st_drop_geometry() |>
+  filter(nidHeightId != "Undetermined") |>
+  select(nidId, state_abb, nidHeight, nidHeightId, starts_with("tri")) |>
+  mutate(nidHeightId_tri_mean_dam = weighted.mean(tri_mean_dam, w = tri_n_dam),
+         nidHeightId_tri_median_dam = median(tri_mean_dam),
+         .by = nidHeightId)
+
+dta_for_plot_p2_nidHeightId_medians <- dta_for_plot_p2 |>
+  distinct(nidHeightId, .keep_all = TRUE)
+
+p2_dam_nidHeightId <- dta_for_plot_p2 |>
+  ggplot() +
+  geom_density(
+    aes(tri_mean_dam),
+    linewidth = 0.1,
+    fill = "grey80",
+    color = NA,
+  ) +
+  geom_text(
+    data = dta_for_plot_p2_nidHeightId_medians,
+    aes(nidHeightId_tri_median_dam, 0, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  geom_text(
+    data = dta_for_plot_p2_nidHeightId_medians,
+    aes(x= I(0.7), y = I(0.8), 
+        label = glue("Median: {round(nidHeightId_tri_median_dam, digits = 1)}")
+        )
+  ) +
+  facet_wrap(~nidHeightId, ncol = 1) +
+  coord_cartesian(xlim = c(0, 55)) +
+  labs(
+    subtitle = "B. Distribution of tri_mean<sub>dam</sub>\nby nidHeightId<br>",
+    y = NULL
+  )
+
+p1_dam_region + p2_dam_nidHeightId +
+  plot_annotation(
+    title = "Distribution of *tri_mean<sub>dam</sub>* for local areas around dams",
+    subtitle = "Red indicator is median tri_mean<sub>dam</sub><br>",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: @fig-state-local-area-tri-summary-density-by-state:
+
+* States with large flat areas as well as mountains have a distribution with a mode in low TRI values and a long tail. See for example, CO, NC, OH, TX (panel A).
+
+```{r}
+#| label: fig-state-local-area-tri-summary-density-by-state
+#| fig-cap: "Distribution of tri_mean<sub>sample</sub> for areas around randomly sampled points in each state"
+#| fig-width: 8
+#| fig-height: 10
+#| column: page-right
+
+dta_for_plot <- state_samples_tri_summary_df |>
+  mutate(state_mean_sample = weighted.mean(tri_mean_sample, w = tri_n_sample),
+         state_median_sample = median(tri_mean_sample),
+         .by = state_abb) |>
+  mutate(state_abb = fct_reorder(state_abb, state_median_sample))
+  
+dta_for_plot2 <- dta_for_plot |>
+  mutate(region_mean_sample = weighted.mean(tri_mean_sample, w = tri_n_sample),
+         region_median_sample = median(tri_mean_sample),
+         .by = region_label) #|>
+  # FYI: need to adjust factors to match regions in panel A if I use the fct_reorder() line below
+  # mutate(region_label = fct_reorder(region_label, region_mean)) 
+
+dta_for_plot2_region_medians <- dta_for_plot2 |>
+  distinct(region_median_sample, .keep_all = TRUE)
+
+p1_sample_state <- dta_for_plot |>
+  ggplot() +
+  geom_density_ridges(
+    aes(tri_mean_sample, state_abb, fill = region_label),
+    rel_min_height = 0.005,
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = state_samples_tri_summary_df |>
+      mutate(
+        state_mean_sample = weighted.mean(tri_mean_sample, w = tri_n_sample),
+        state_median_sample = median(tri_mean_sample),
+        .by = state_abb
+      ) |>
+      distinct(state_abb, state_median_sample),
+    aes(state_median_sample, state_abb, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_x_continuous(breaks = 0:10 * 5) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.75, 0.15)) +
+  coord_cartesian(xlim = c(0, 30)) +
+  labs(
+    subtitle = "A. Distribution of tri_mean<sub>sample</sub><br>",
+    y = NULL
+  )
+
+p2 <- dta_for_plot |>
+  ggplot() +
+  geom_col(
+    aes(tri_n_sample, state_abb, fill = region_label),
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") +
+  labs(
+    subtitle = "B. Number of TRI values<br>",
+    y = NULL
+  )
+
+p1_sample_state + p2 +
+  plot_annotation(
+    title = "Distribution of *tri_mean<sub>sample</sub>* for local area<br>around sampled points in each state",
+    subtitle = "Red indicator is median tri_mean<sub>sample</sub><br>",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: fig-state-local-area-tri-summary-density-non-state:
+
+* Similar to @fig-dam-local-area-tri-summary-density-non-state, there is more variation in $tri\_mean_{sample}$ in the Northeast and West, which have higher median $tri\_mean_{sample}$ than the North Central and South regions (panel A).
+
+* North Central looks by eye to be the region with a distribution of $tri\_mean_{sample}$ closest to the overall distribution (panel B), however Northeast region has the closest median $tri\_mean_{sample}$.
+
+```{r}
+#| label: fig-state-local-area-tri-summary-density-non-state
+#| fig-cap: "Distribution of tri_mean<sub>sample</sub> for areas around randomly sampled points in each state"
+#| fig-width: 6
+#| fig-height: 6
+#| column: page-right
+
+dta_for_plot <- state_samples_tri_summary_df |>
+  mutate(region_mean_sample = weighted.mean(tri_mean_sample, w = tri_n_sample),
+         region_median_sample = median(tri_mean_sample),
+         .by = c(region_label))
+
+dta_for_plot_p1_region_medians <- dta_for_plot |>
+  distinct(region_label, .keep_all = TRUE)
+
+p1_sample_region <- dta_for_plot |>
+  ggplot() +
+  geom_density(
+    aes(tri_median_sample, fill = region_label),
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = dta_for_plot_p1_region_medians,
+    aes(region_mean_sample, 0, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  geom_text(
+    data = dta_for_plot_p1_region_medians,
+    aes(x= I(0.7), y = I(0.8), 
+        label = glue("Median: {round(region_median_sample, digits = 1)}")
+        )
+  ) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") +
+  facet_wrap(~region_label, ncol = 1) +
+  coord_cartesian(xlim = c(0, 55)) +
+  labs(
+    subtitle = "A. Distribution of tri_mean<sub>sample</sub> by region<br>",
+    y = NULL
+  )
+
+dta_for_plot_p1_overall_median <- dta_for_plot |>
+  summarize(overall_tri_median_sample = mean(tri_mean_sample))
+
+p2_sample_overall <- dta_for_plot |>
+  ggplot() +
+  geom_density(
+    aes(tri_mean_sample),
+    linewidth = 0.1,
+    fill = "grey80",
+    color = NA,
+    # alpha = 0.3
+  ) +
+  geom_text(
+    data = dta_for_plot_p1_overall_median,
+    aes(overall_tri_median_sample, 0, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  geom_text(
+    data = dta_for_plot_p1_overall_median,
+    aes(x= I(0.7), y = I(0.8), 
+        label = glue("Median: {round(overall_tri_median_sample, digits = 1)}")
+        )
+  ) +
+  # facet_wrap(~nidHeightId, ncol = 1) +
+  coord_cartesian(xlim = c(0, 55)) +
+  labs(
+    subtitle = "B. Distribution of tri_mean<sub>sample</sub><br>",
+    y = NULL
+  )
+
+p1_sample_region + p2_sample_overall +
+  plot_annotation(
+    title = "Distribution of *tri_mean<sub>sample</sub>* for local areas around random points",
+    subtitle = "Red indicator is median tri_mean<sub>sample</sub><br>",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+### Second: difference in tri_mean<sub>dam</sub> - tri_mean<sub>sample</sub>
+
+```{r}
+#| label: define-tri-diff-model-data
+
+tri_dam_tmp <- dams_with_tri |>
+      st_drop_geometry() |>
+      select(nidId, state_abb, nidHeight, nidHeightId, nidStorage, surfaceArea, starts_with("tri_")) |>
+  arrange(state_abb, tri_mean_dam)
+
+n_tri_dam_tmp <- tri_dam_tmp |>
+  count(state_abb, name = "n_dams")
+
+tri_sample_tmp <- state_samples_tri_summary_df
+
+check_n <- left_join(
+  dams_with_tri |>
+    st_drop_geometry() |>
+    count(state_abb, name = "n_dam"),
+  state_dam_tri_summary_df |>
+    count(state_abb, name = "n_sample"),
+  by = "state_abb"
+) |>
+  mutate(
+    n_diff = n_sample - n_dam
+  )
+
+# Need n_diff to be zero for all states to pair tri_mean_dam and tri_mean_sample in dta_for_model
+
+if(sum(check_n$n_diff) != 0) {
+  # We have some work to do
+  
+  tri_sample_tmp2 <- tri_sample_tmp |>
+    left_join(check_n,
+              by = "state_abb")
+  
+  if(any(check_n$n_diff) < 0) {
+    stop("Code block define-tri-diff-model-data: at least one state has fewer rows of sample points than dams. Fix this manually.")
+  } 
+  
+  tri_sample_tmp3 <- tri_sample_tmp2 |>
+    mutate(
+      test_n_sample = n_sample - n_diff,
+      test_tri_mean_sample = if_else(row_number() <= n_diff,
+                              NA_real_,
+                              tri_mean_sample),
+      .by = state_abb
+    ) |>
+    filter(!is.na(test_tri_mean_sample)) |>
+    mutate(#test_tri_n_sample = test_tri_mean_sample,
+           n_diff2 = test_n_sample - n_dam
+    ) |>
+    select(-starts_with("test")) |>
+    # TODO: solve the following kludge at source and remove this filter
+    filter(!(state_abb == "TX" & row_number() <=3) &
+             !(state_abb == "VT" & row_number() == 1) &
+             !(state_abb == "WV" & row_number() == 1),
+           .by = state_abb)
+  
+  n_tri_sample_tmp3 <- tri_sample_tmp3 |>
+    count(state_abb, name = "tri_sample_n2")
+  
+  tri_check_tmp <- 
+    inner_join(
+      n_tri_sample_tmp3,
+      n_tri_dam_tmp,
+      by = join_by(state_abb)
+    ) |>
+    mutate(dif = tri_sample_n2 - n_dams) |>
+    arrange(desc(dif))
+  
+  state_abb_levels <- tri_dam_tmp |>
+    mutate(mean_tri_mean_dam = mean(tri_mean_dam),
+           .by = state_abb
+    ) |>
+    arrange(mean_tri_mean_dam) |>
+    distinct(state_abb, mean_tri_mean_dam) |>
+    mutate(state_abb = as_factor(state_abb)) # keeps current order
+  
+} else {
+  # no adjustments needed
+  
+  state_tri_tmp3 <- tri_dam_tmp #
+  
+}
+
+dta_for_model <- 
+  bind_cols(
+    tri_sample_tmp3 |>
+      group_by(state_abb) |>
+      arrange(tri_mean_sample,
+              .by_group = TRUE) |>
+      ungroup(),
+    tri_dam_tmp |>
+      group_by(state_abb) |>
+      arrange(tri_mean_dam,
+              .by_group = TRUE) |>
+      ungroup() |>
+      select(-state_abb) # already in state_tri_tmp
+  ) |>
+  mutate(tri_diff_dam_sample = tri_mean_dam - tri_mean_sample,
+         area_to_volume_dam = surfaceArea / nidStorage,
+         state_abb = factor(state_abb, levels = state_abb_levels$state_abb)
+         ) |>
+  filter(nidId != "NM00039", # surfaceArea seems to be an error (or very major outlier)
+         nidId != "MI00650") # Lake Superior adjustments as noted in an earlier chapter
+
+n_dams_by_nidHeightId <- dta_for_model |>
+  count(nidHeightId) |>
+  mutate(
+    supports_h1 = nidHeightId %in% c("Less than 25 feet", "25-50 feet")
+  )
+
+n_dams_support_h1 <- sum(n_dams_by_nidHeightId[n_dams_by_nidHeightId$supports_h1, ]$n)
+pct_dams_support_h1 <- n_dams_support_h1 / sum(n_dams_by_nidHeightId$n)
+
+states_support_h1 <- dta_for_model |>
+  mutate(
+    supports_h1 = tri_mean_dam > tri_mean_sample 
+  ) |>
+  reframe(
+    n_dams_state = n(),
+    n_dams_state_support_h1 = sum(supports_h1),
+    .by = state_abb
+  ) |>
+  mutate(
+    pct_dams_in_state_support_h1 = n_dams_state_support_h1 / n_dams_state
+  )
+
+n_states_support_h1 <- states_support_h1 |>
+  filter(pct_dams_in_state_support_h1 > 0.5) |>
+  nrow()
+
+```
+
+Of note re: @fig-mean-tri-diff-dam-and-state-by-state and related data:
+
+Aggregations in which $median({tri\_mean_{dam} - tri\_mean_{sample}}) > 0$ have a higher terrain ruggedness than the state in general. The panels in @fig-mean-tri-diff-dam-and-state-by-state reveal the following:
+
+* Panel A: there is a lot of variation in the distributions by state.
+
+  - `r n_states_support_h1` of `r n_states_with_dams` states (`r percent(n_states_support_h1 / n_states_with_dams)`) have positive ${median(tri\_mean_{dam} - tri\_mean_{sample})} > 0$, supporting $H_1$.
+  
+  - in flatter states $H_1$ holds true. In mountainous states it does not.
+  
+* Panel B: the median for all dams and samples is slightly positive, supporting $H_1$.
+* Panel C: North Central and South regions have a (mildly) positive median. These, the flattest regions, support $H_1$.
+* Panel D:`nidHeightId` categories < 50 ft have positive means, which includes most dams
+
+  - `r n_dams_support_h1` of `r sum(n_dams_by_nidHeightId$n)` (`r percent(pct_dams_support_h1)`) support $H_1$.
+  
+```{r}
+#| label: fig-mean-tri-diff-dam-and-state-by-state
+#| fig-cap: "Distribution of dam tri_mean<sub>dam</sub> and tri_mean<sub>state sample</sub> by state"
+#| fig-width: 10
+#| fig-height: 10
+#| column: page-right
+
+data_for_plot <- dta_for_model |>
+  mutate(state_abb = fct_reorder(state_abb, tri_diff_dam_sample))
+
+p1_medians <- data_for_plot |>
+  summarize(state_median = median(tri_diff_dam_sample),
+         .by = state_abb)
+
+p1_diff_dam_sample <- data_for_plot |>
+  ggplot() +
+  geom_density_ridges(
+    aes(tri_diff_dam_sample, state_abb, fill = region_label),
+    rel_min_height = 0.005,
+    quantile_lines = TRUE,
+    quantiles = 2,
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_vline(
+    xintercept = 0,
+    lty = 2,
+    linewidth = 0.25,
+    alpha = 0.5) +
+  geom_text(
+    data = p1_medians,
+    aes(state_median, state_abb, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.25, 0.85)) +
+  coord_cartesian(xlim = c(-13, 6)) +
+  labs(
+    subtitle = "A. By state",
+    y = NULL,
+    fill = "Region (n=states)"
+  )
+
+p2_median <- data_for_plot |>
+  summarize(state_median = median(tri_diff_dam_sample))
+
+p2_diff_all <- data_for_plot |>
+  ggplot() +
+  geom_density(
+    aes(tri_diff_dam_sample),
+    linewidth = 0.1,
+    color = "grey80",
+    fill = "grey80",
+    # alpha = 0.5
+  ) +
+  geom_vline(
+    xintercept = 0,
+    lty = 2,
+    linewidth = 0.25,
+    alpha = 0.5) +
+  geom_text(
+    data = p2_median,
+    aes(state_median, 0, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") +
+  annotate("text", x= I(0.3), y = I(0.8), label = glue("Median: {round(p2_median$state_median, digits = 2)}")) +
+  labs(
+    subtitle = "B. All in one"
+  )
+
+p3_medians <- data_for_plot |>
+  summarize(median_tri_diff_dam_state = median(tri_diff_dam_sample),
+            .by = region_label)
+
+p3_diff_region <- data_for_plot |>
+  ggplot() +
+  geom_density(
+    aes(tri_diff_dam_sample, fill = region_label),
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_vline(
+    xintercept = 0,
+    lty = 2,
+    linewidth = 0.25,
+    alpha = 0.5) +
+  geom_text(
+    data = p3_medians,
+    aes(median_tri_diff_dam_state, 0, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  geom_text(
+    data = p3_medians,
+    aes(x= I(0.3), y = I(0.8), 
+        label = glue("Median: {round(median_tri_diff_dam_state, digits = 1)}")
+        )
+  ) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") +
+  facet_wrap(~region_label, ncol = 2) +
+  labs(
+    subtitle = "C. By region",
+    y = NULL
+  )
+
+p4_medians <- data_for_plot |>
+  summarize(median_tri_diff_dam_state = median(tri_diff_dam_sample),
+            .by = nidHeightId)
+
+p4_diff_nidHeightId <- data_for_plot |>
+  ggplot() +
+  geom_density(
+    aes(tri_diff_dam_sample, fill = nidHeightId),
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_vline(
+    xintercept = 0,
+    lty = 2,
+    linewidth = 0.25,
+    alpha = 0.5) +
+  geom_text(
+    data = p4_medians,
+    aes(median_tri_diff_dam_state, 0, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  geom_text(
+    data = p4_medians,
+    aes(x= I(0.3), y = I(0.8), 
+        label = glue("Median: {round(median_tri_diff_dam_state, digits = 2)}")
+        )
+  ) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") +
+  facet_wrap(~nidHeightId, ncol = 2) +
+  labs(
+    subtitle = "D. By nidHeightId",
+    y = NULL
+  )
+
+p1_diff_dam_sample + (p2_diff_all / p3_diff_region / p4_diff_nidHeightId) +
+  plot_annotation(
+    title = "Distributions of *tri_mean<sub>dam</sub> - tri_mean<sub>sample</sub>*<br>",
+    subtitle = glue("TRI means calculated from 5 km circles around each of {n_dams} dams",
+                    " and same number of random samples in each state.",
+                    "\nRed indicators are median(tri_mean<sub>dam</sub> - tri_mean<sub>sample</sub>)<br>"),
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: fig-three-tri-mean-distributions-by-date:
+
+* This plot of distributions is a recap of earlier plots. I place them next to each other for easy comparison.
+
+* Where the distribution of $tri\_mean_{dam}$ (panel A) differs from $tri\_mean_{sample}$ (panel B), it tells us the ruggedness around dams is not representative of the state. For example, Colorado doesn't seem to have many dams in the flat, eastern part of the state--or the dams in the eastern part are in relatively rare hilly areas. I also note that more distributions in panel B seem to have long tails of high $tri\_mean_{sample}$ values.
+
+* Panel C is ordered by the size of the difference $tri\_mean_{dam} - tri\_mean_{sample}$ for each state (a different ordering than panel A or B). States with a positive difference support $H_1$; those near zero or negative challenge it.
+
+```{r}
+#| label: fig-three-tri-mean-distributions-by-date
+#| fig-cap: "Distribution of TRI means in each state"
+#| fig-width: 10
+#| fig-height: 10
+#| column: page-right
+
+(p1_dam_state + 
+   labs(subtitle = "A. Distribution of tri_mean_dam")) + 
+  (p1_sample_state + 
+     labs(subtitle = "B. Distribution of tri_mean_sample")) + 
+  (p1_diff_dam_sample + 
+     labs(subtitle = "C. Distribution of tri_diff_dam_sample")) +
+  plot_annotation(
+    title = "tri_mean distributions",
+    subtitle = glue("Red indicator is median tri_mean for each variable. Ordered by descending median.",
+                    "\nNote that each subplot orders the states differently."),
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple()) &
+  guides(fill = "none")
+
+```
+
+<br>
+
+Of note re: @fig-tri-mean-sample-by-tri-mean-dam:
+
+* Plots in panels A1 and B1 appear to show that $tri\_mean_{sample}$ exceeds $tri\_mean_{dam}$ in most cases, which would disprove $H_1$.
+
+* However, panels A1 and B1 hide most of the data, which have low $tri\_mean$ values. The log-log plots in panels A2 and B2 show that in most cases, $tri\_mean_{dam}$ exceeds $tri\_mean_{sample}$.
+
+* In other words, in flatter areas $H_1$ holds true. In mountainous areas it does not.
+
+```{r}
+#| label: fig-tri-mean-sample-by-tri-mean-dam
+#| fig-cap: "Distribution of TRI means in each state"
+#| fig-width: 8
+#| fig-height: 6
+#| column: page-right
+
+p1 <- dta_for_model |>
+  filter(tri_mean_dam > 0,
+         tri_mean_sample > 0) |>
+  ggplot(aes(tri_mean_dam, tri_mean_sample, color = state_abb, group = state_abb)) +
+  geom_line(
+    linewidth = 0.25,
+    alpha = 0.8
+  ) +
+  geom_abline(
+    lty = 2,
+    linewidth = 0.25,
+    alpha = 0.5
+  ) +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA),
+                  ylim = c(0.01, NA)) +
+  labs(
+    subtitle = "A1. Line plot",
+    x = "tri_mean_dam",
+    y = "tri_mean_sample"
+  )
+
+p1_log_log <- dta_for_model |>
+  filter(tri_mean_dam > 0,
+         tri_mean_sample > 0) |>
+  ggplot(aes(tri_mean_dam, tri_mean_sample, color = state_abb, group = state_abb)) +
+  geom_line(
+    linewidth = 0.25,
+    alpha = 0.8
+  ) +
+  geom_abline(
+    lty = 2,
+    linewidth = 0.25,
+    alpha = 0.5
+  ) +
+  scale_x_log10() +
+  scale_y_log10() +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA),
+                  ylim = c(0.01, NA)) +
+  labs(
+    subtitle = "A2. Line plot (log10 scales)",
+    x = "tri_mean_dam (log10 scale)",
+    y = "tri_mean_sample (log10 scale)"
+  )
+
+p2 <- dta_for_model |>
+  filter(tri_mean_dam > 0,
+         tri_mean_sample > 0) |>
+  ggplot(aes(tri_mean_dam, tri_mean_sample, 
+             color = state_abb, group = state_abb)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.2,
+    alpha = 0.8,
+    se = FALSE) +
+  geom_abline(
+    lty = 2,
+    linewidth = 0.25,
+    alpha = 0.5
+  ) +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA),
+                  ylim = c(0.01, NA)) +
+  guides(color = "none") +
+  labs(
+    subtitle = "B1. Regression line plot (same data)",
+    x = "tri_mean_dam",
+    y = "tri_mean_sample"
+  )
+
+p2_log_log <- dta_for_model |>
+  filter(tri_mean_dam > 0,
+         tri_mean_sample > 0) |>
+  ggplot(aes(tri_mean_dam, tri_mean_sample, 
+             color = state_abb, group = state_abb)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.2,
+    alpha = 0.8,
+    se = FALSE) +
+  geom_abline(
+    lty = 2,
+    linewidth = 0.25,
+    alpha = 0.5
+  ) +
+  scale_x_log10() +
+  scale_y_log10() +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA),
+                  ylim = c(0.01, NA)) +
+  guides(color = "none") +
+  labs(
+    subtitle = "B2. Regression line plot (log10 scales)",
+    x = "tri_mean_dam (log10 scale)",
+    y = "tri_mean_sample (log10 scale)"
+  )
+
+p1 + p1_log_log + p2 + p2_log_log +
+  plot_annotation(
+    title = "tri_mean<sub>sample</sub> by tri_mean<sub>dam</sub> for each state",
+    subtitle = "In most states, tri_mean<sub>sample</sub> is larger than tri_mean<sub>dam</sub>, disproving H1<br>",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+### Regression models
+
+I ordered $tri\_mean_{dam}$ and $tri\_mean_{sample}$ from smallest to largest in each state before combining them in `dta_for_model`. The data set includes `r comma(nrow(dta_for_model))` pairs in `r length(unique(dta_for_model$state_abb))` states. `r min_dams_n_state$state_abb` has the least dams: `r min_dams_n_state$n`. `r max_dams_n_state$state_abb` has the most dams: `r max_dams_n_state$n`. 
+
+Thus, when model mod.h1.1 $tri\_mean_{dam} \sim \beta_1 tri\_mean_{sample} + \epsilon$ has $\beta_1 > 1.0$ , it would that $tri\_mean_{dam}$ in general is larger than $tri\_mean_{sample}$ , which would consistent with the conclusions from @fig-mean-tri-diff-dam-and-state-by-state in the prior section in supporting $H_1$.
+
+#### Model mod.h1.1 {#sec-h1-mod1}
+
+mod.h1.1 explains most of the variation: $R^2 = 0.87$.
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-tri-mean-sample
+
+mod.h1.1 <- dta_for_model |>
+  lm(tri_mean_dam ~ tri_mean_sample,
+     data = _)
+
+summary(mod.h1.1)
+
+```
+
+<br>
+
+$\beta_1$ in $\beta_1 tri\_mean_{dam}$ is `r round(unname(coef(mod.h1.1)[2]), digits = 2)`, meaning $tri\_mean_{dam}$ is on average `r percent(unname(coef(mod.h1.1)[2]))` the size of $tri\_mean_{sample}$, apparently disproving $H_1$.
+
+Note there is an implicit $\left\{\beta_1,..\beta_n\right\}$ before each term $\left\{term_1,..term_n\right\}$ in the regression formulas (and $+ \epsilon$) at the end. For the sake of brevity and readability, I omit them from the formulas in the remainder of this chapter.
+
+<br>
+
+#### Model mod.h1.2 {#sec-h1-mod2}
+
+mod.h1.2 explains more than a third of the variance using only state means: $R^2 = 0.43$. This is a base model useful when considering the variance explained by other models.
+
+$$mod.h1.2: tri\_mean_{dam} \sim 1 | state$$ 
+
+```{r}
+#| label: lm-tri-mean-dam-effect-per-state
+
+mod.h1.2 <- dta_for_model |>
+  mutate(#tri_mean_sample_scaled = scale(tri_mean_sample),
+         tri_mean_dam_scaled = scale(tri_mean_dam)
+         ) |>
+  lmer(tri_mean_dam_scaled ~ 1 | state_abb,
+     data = _)
+
+summary(mod.h1.2)
+
+r_squared <- rsq(mod.h1.2)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 3)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 3)}", 
+     " and random effects: {round(r_squared$random, digits = 3)}"
+  )
+
+```
+
+<br>
+
+For this model, which includes only intercepts for each state: `r rsq_comment`.
+
+<br>
+
+#### Model mod.h1.3 {#sec-h1-mod3}
+
+mod.h1.3 explains more than a third of the variance using only state means: $R^2 = 0.39$. This is a base model useful when considering the variance explained by other models.
+
+$$mod.h1.3: tri\_mean_{sample} \sim 1 | state$$ 
+
+```{r}
+#| label: lm-tri-mean-sample-effect-per-state
+
+mod.h1.3 <- dta_for_model |>
+  mutate(tri_mean_sample_scaled = scale(tri_mean_sample),
+         # tri_mean_dam_scaled = scale(tri_mean_dam)
+         ) |>
+  lmer(tri_mean_sample_scaled ~ 1 | state_abb,
+     data = _)
+
+summary(mod.h1.3)
+
+r_squared <- rsq(mod.h1.3)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 3)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 3)}", 
+     " and random effects: {round(r_squared$random, digits = 3)}"
+  )
+
+```
+
+<br>
+
+For this model, which includes only intercepts for each state: `r rsq_comment`.
+
+```{r}
+#| label: fig-lmer-random-effect-conditional-means-mod-h1-3
+#| fig-cap: "mod.h1.3 random effect condidtional means"
+#| fig-width: 6
+#| fig-height: 10
+#| column: page-right
+
+as.data.frame(ranef(mod.h1.3, condVar = FALSE)) |>
+  rename(state_abb = grp) |>
+  select(-grpvar) |>
+  left_join(
+    states_and_regions,
+    by = join_by(state_abb)
+  ) |>
+  mutate(state_abb = fct_reorder(state_abb, condval)) |>
+  ggplot(aes(condval, state_abb, fill = region_label)) +
+  geom_col() +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.75, 0.2)) +
+  labs(
+    title = "mod.h1.3 random effect\nconditional means indicate\nrelative level of mean ruggedness",
+    subtitle = "West Virginia has the highest tri_mean, and Delaware has the lowest.",
+    x = "Conditional mean",
+    y = NULL,
+    caption = my_caption_nid_opentopography
+  )
+
+```
+
+<br>
+
+#### Model mod.h1.4 {#sec-h1-mod4}
+
+Better is a linear mixed model adjusting for states. mod.h1.3 explains even more of the variation: $R^2 = 0.95$.
+
+$$mod.h1.4: tri\_mean_{dam} \sim tri\_mean_{sample} | state$$ 
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-tri-mean-sample-by-state
+
+mod.h1.4 <- dta_for_model |> # dams_with_tri |>
+  mutate(tri_mean_dam_scaled = scale(tri_mean_dam), 
+         tri_mean_sample_scaled = scale(tri_mean_sample))|>
+  lmer(tri_mean_dam_scaled ~ tri_mean_sample_scaled + state_abb + (1 | state_abb),
+       data = _)
+
+summary(mod.h1.4)
+
+r_squared <- rsq(mod.h1.4)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 2)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 2)}", 
+     " and random effects: {round(r_squared$random, digits = 2)}"
+  )
+
+```
+
+<br>
+
+For this model `r rsq_comment`.
+
+<br>
+
+While residuals are mostly small, a plot of residuals by predicted (@fig-lm-tri-mean-dam-explained-by-tri-mean-sample-by-state-evaluate) is not what we'd hope for:
+
+```{r}
+#| label: fig-lm-tri-mean-dam-explained-by-tri-mean-sample-by-state-evaluate
+#| fig-cap: "Residuals of model mod.h1.4 are mostly small but not randomly distributed"
+#| fig-height: 10
+#| fig-width: 10
+
+# following pattern at 
+# https://mspeekenbrink.github.io/sdam-r-companion/linear-mixed-effects-models.html#visually-assessing-model-assumptions
+
+tdat <- tibble(predicted = predict(mod.h1.4), 
+               residual = residuals(mod.h1.4), 
+               state_abb = dta_for_model$state_abb)
+
+p0 <- tdat |>
+  ggplot(aes(abs(residual))) + 
+  geom_histogram(binwidth = 0.1, 
+                 alpha = 0.5) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA)) +
+  labs(
+    subtitle = "A. Histogram (residuals)",
+    x = "abs(residual)",
+  )
+
+p1 <- tdat |>
+  ggplot(aes(x = predicted, y = residual,
+             color = state_abb)) + 
+  geom_point(size = 0.25,
+             alpha = 0.25) +
+  geom_hline(yintercept = 0, 
+             lty = 2,
+             linewidth = 0.5,
+             alpha = 0.5) +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA)) +
+  labs(
+    subtitle = "A. Scatter plot"
+  )
+
+p1b <- tdat |>
+  ggplot(aes(x = predicted, y = residual,
+             color = state_abb)) + 
+  geom_line(linewidth = 0.2,
+             alpha = 0.8) + 
+  geom_hline(yintercept = 0, 
+             lty = 2,
+             linewidth = 0.5,
+             alpha = 0.5) +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA)) +
+  labs(
+    subtitle = "A2. Line plot (same data)",
+  )
+
+p2 <- tdat |>
+  ggplot(aes(abs(residual),
+             color = state_abb)) + 
+  stat_ecdf(linewidth = 0.2,
+             alpha = 0.8,
+            pad = FALSE) +
+  scale_y_continuous(labels = label_percent()) +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA)) +
+  labs(
+    subtitle = "B1. ECDF plot (residuals)",
+    x = "abs(residual)",
+    y = "Percent of residuals"
+  )
+
+p2b <- tdat |>
+  filter(residual > 0) |> # because scale_x_log10()
+  ggplot(aes(abs(residual),
+             color = state_abb)) + 
+  stat_ecdf(linewidth = 0.2,
+             alpha = 0.8,
+            pad = FALSE) +
+  stat_ecdf(data = tdat |>
+              filter(residual > 0),
+            aes(abs(residual), color = state_abb),
+            linewidth = 1,
+            color = "blue",
+             alpha = 0.8,
+            pad = FALSE) +
+  scale_x_log10() +
+  scale_y_continuous(labels = label_percent()) +
+  guides(color = "none") +
+  coord_cartesian(xlim = c(0.01, NA)) +
+  labs(
+    subtitle = "B2. ECDF plot (residuals on log10 scale)",
+    x = "abs(residual) (log10 scale)",
+    y = "Percent of residuals"
+  )
+
+my_layout <- 
+c("
+AA
+BC
+DE")
+
+p0 + p1 + p1b + p2 + p2b +
+  plot_annotation(
+    title = "mod.h1.4 residuals are small but far from the random distribution\none looks for in a well-described model",
+    subtitle = 'Each "thread" is the residuals for a state',
+    caption = my_caption_nid_opentopography
+  ) +
+  plot_layout(design = my_layout)
+
+```
+
+<br>
+
+```{r}
+#| label: fig-lm-tri-mean-dam-explained-by-tri-mean-samples-qq-plot
+#| fig-cap: "mod.h1.4 QQ Plot shows the model produces heavy non-normal tails"
+#| fig-height: 6
+#| fig-width: 6
+
+ggplot(tdat, aes(sample = residual)) +
+  stat_qq() + 
+  stat_qq_line(
+    lty = 2,
+    linewidth = 0.5,
+    alpha = 0.5
+  ) +
+  labs(
+    title = "mod.h1.4 QQ Plot residuals are not normal",
+    subtitle = "Tails are heavier than a normal distribution would produce",
+    caption = my_caption_nid_opentopography
+  )
+
+```
+
+<br>
+
+### Conclusion: H<sub>1</sub>
+
+From the plots:
+
+* @fig-mean-tri-diff-dam-and-state-by-state is quite helpful. All four panels support $H_1$.
+* @fig-tri-mean-sample-by-tri-mean-dam is also helpful. The log-log plots in panels A2 and B2 show that in most cases, $tri\_mean_{dam}$ exceeds $tri\_mean_{sample}$. 
+
+In flatter areas $H_1$ is true. In mountainous areas it is not.
+
+From the regressions:
+
+* *@sec-h1-mod4 @mod.h1.4* best describes the variation in the data. Conditional means of the state effects are also aligned with the states' $median(tri\_mean_{sample})$.
+
+* The regressions don't make a strong case for $H_1$.
+
+<br>
+
+## Exploring H<sub>2</sub> : In states with higher terrain ruggedness, dams' $\frac{surfaceArea}{nidStorage}$ will be lower {#sec-h2-explore}
+
+As a reminder:
+
+Where dams are in more rugged areas, it seems likely dams' lakes will be deeper and thus have smaller ratios $\frac{surfaceArea}{nidStorage}$. In other words, considering the states in the continental US, there is an inverse proportional relationship:
+
+$$tri\_mean_{sample} \propto \frac{1}{\left(\frac{surfaceArea}{nidStorage}\right)}$$
+
+I look at two regressions:
+
+1. lm(tri_mean_sample ~ ratio)
+
+  - How much does this simple mode capture the variance in the data? Does it perform better than the base model looking only at state effects *@sec-h1-mod3*?
+  
+2. lmer(tri_mean_sample ~ ratio + (1 | state_abb)
+
+  - I assume this is the model likely to explain more variance than the other models.
+
+where $ratio = \frac{surfaceArea}{nidStorage}$.
+
+### First: `surfaceArea` and `nidStorage` distributions
+
+#### Data availability
+
+The NID records are mostly complete with `nidHeight.` In comparison, there are more gaps for `nidStorage` (water volume) and water `surfaceArea`. For most states, the `nidStorage` missing rate is less than 4%. The exception is Connecticut, where the missing rate is 35%
+
+```{r}
+#| label: tbl-missing-nidStorage-by-state
+#| tbl-cap-location: bottom
+#| tbl-cap: "Missing nidStorage by state"
+
+missing_nidStorage_by_state <- dta_for_model |>
+  select(state_abb, nidStorage) |>
+  mutate(no_nidStorage = is.na(nidStorage)) |>
+  reframe(n_dams = n(),
+          n_missing_nidStorage = sum(no_nidStorage),
+          pct_missing_nidStorage = n_missing_nidStorage / n_dams,
+          .by = state_abb) |>
+  arrange(desc(pct_missing_nidStorage)) |>
+  filter(pct_missing_nidStorage > 0) |>
+  adorn_totals(where = "row") |>
+  mutate(rowid = row_number(),
+         pct_missing_nidStorage = n_missing_nidStorage / n_dams) # Do this again to pick up total row
+
+missing_nidStorage_by_state |>
+  gt() |>
+  tab_header(md("**Percent of dams missing nidStorage values**")) |>
+  fmt_percent(columns = starts_with("pct_"),
+              decimals = 2)
+
+```
+
+Only the smallest dams have a missing 1 rate greater than 1%:
+
+```{r}
+#| label: tbl-missing-nidStorage-by-nidHeightId
+#| tbl-cap-location: bottom
+#| tbl-cap: "Missing nidStorage by nidHeightId"
+
+missing_nidStorage_by_nidHeightId <- dta_for_model |>
+  select(nidHeightId, nidStorage) |>
+  mutate(no_nidStorage = is.na(nidStorage)) |>
+  reframe(n_dams = n(),
+          n_missing_nidStorage = sum(no_nidStorage),
+          pct_missing_nidStorage = n_missing_nidStorage / n_dams,
+          .by = nidHeightId) |>
+  # arrange(desc(pct_missing_nidStorage)) |>
+  filter(pct_missing_nidStorage > 0) |>
+  adorn_totals(where = "row") |>
+  mutate(rowid = row_number(),
+         pct_missing_nidStorage = n_missing_nidStorage / n_dams) # Do this again to pick up total row
+
+missing_nidStorage_by_nidHeightId |>
+  gt() |>
+  tab_header(md("**Percent of dams missing nidStorage values**")) |>
+  fmt_percent(columns = starts_with("pct_"),
+              decimals = 2) |>
+  cols_align(columns = nidHeightId,
+             align = "left")
+
+```
+
+<br>
+
+For `surfaceArea` the gaps are worse. For example, Utah and Montana, South Dakota, and Alabama are missing `surfaceArea` for more than 75% of their dams. Among all dams, 20% are missing this data.
+
+```{r}
+#| label: tbl-missing-surfaceArea-by-state
+#| tbl-cap-location: bottom
+#| tbl-cap: "Missing surfaceArea by state"
+
+missing_surfaceArea_by_state <- dta_for_model |>
+  select(state_abb, surfaceArea) |>
+  mutate(no_surfaceArea = is.na(surfaceArea)) |>
+  reframe(n_dams = n(),
+          n_missing_surfaceArea = sum(no_surfaceArea),
+          pct_missing_surfaceArea = n_missing_surfaceArea / n_dams,
+          .by = state_abb) |>
+  arrange(desc(pct_missing_surfaceArea)) |>
+  filter(pct_missing_surfaceArea > 0) |>
+  adorn_totals(where = "row") |>
+  mutate(rowid = row_number(),
+         pct_missing_surfaceArea = n_missing_surfaceArea / n_dams) # Do this again to pick up total row
+
+missing_surfaceArea_by_state |>
+  gt() |>
+  tab_header(md("**Percent of dams missing surfaceArea values**")) |>
+  fmt_percent(columns = starts_with("pct_"),
+              decimals = 2)
+
+```
+
+<br>
+
+The biggest gaps in `surfaceArea` data are for the smallest dams, where a quarter are missing.
+
+```{r}
+#| label: tbl-missing-surfaceArea-by-nidHeightId
+#| tbl-cap-location: bottom
+#| tbl-cap: "Missing surfaceArea by nidHeightId"
+
+missing_surfaceArea_by_nidHeightId <- dta_for_model |>
+  select(nidHeightId, surfaceArea) |>
+  mutate(no_surfaceArea = is.na(surfaceArea)) |>
+  reframe(n_dams = n(),
+          n_missing_surfaceArea = sum(no_surfaceArea),
+          pct_missing_surfaceArea = n_missing_surfaceArea / n_dams,
+          .by = nidHeightId) |>
+  # arrange(desc(pct_missing_surfaceArea)) |>
+  filter(pct_missing_surfaceArea > 0) |>
+  adorn_totals(where = "row") |>
+  mutate(rowid = row_number(),
+         pct_missing_surfaceArea = n_missing_surfaceArea / n_dams) # Do this again to pick up total row
+
+missing_surfaceArea_by_nidHeightId |>
+  gt() |>
+  tab_header(md("**Percent of dams missing surfaceArea values**")) |>
+  fmt_percent(columns = starts_with("pct_"),
+              decimals = 2) |>
+  cols_align(columns = nidHeightId,
+             align = "left")
+
+```
+
+<br>
+
+Let's proceed with exploring $H_2$, recognizing that for some states the results may not be useful.
+
+#### Plots
+
+In this section I look at the distributions and relationship between `surfaceArea` and `nidStorage` before exploring their associations with $tri\_mean_{sample}$ in the next section.
+
+Of note in @fig-distributions-of-surfaceArea-and-nidStorage-by-state:
+
+* The distributions of `surfaceArea`, `nidStorage`, and $\frac{surfaceArea}{nidStorage}$ differ in many states. I'm not sure what to make of this fact.
+
+```{r}
+#| label: fig-distributions-of-surfaceArea-and-nidStorage-by-state
+#| fig-cap: "Distributions by state: surfaceArea, nidStorage, and surfaceArea / nidStorage"
+#| fig-width: 8
+#| fig-height: 12
+#| column: page-right
+
+dta_for_plot <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  mutate(state_median_surfaceArea = median(surfaceArea),
+         state_median_nidStorage = median(nidStorage),
+         state_median_area_to_vol = median(area_to_volume_dam),
+         .by = state_abb) |>
+  mutate(state_abb = fct_reorder(state_abb, state_median_surfaceArea))
+
+p1_surfaceArea_by_state <- dta_for_plot |>
+  ggplot() +
+  geom_density_ridges(
+    aes(surfaceArea, state_abb, fill = region_label),
+    rel_min_height = 0.005,
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = dta_for_plot |>
+      distinct(state_abb, state_median_surfaceArea),
+    aes(state_median_surfaceArea, state_abb, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  # guides(fill = guide_legend(position = "inside")) +
+  guides(fill = "none") + #guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.75, 0.15)) +
+  labs(
+    subtitle = "A. surfaceArea<br>",
+    y = NULL
+  )
+
+p2_nidStorage_by_state <- dta_for_plot |>
+  ggplot() +
+  geom_density_ridges(
+    aes(nidStorage, state_abb, fill = region_label),
+    rel_min_height = 0.005,
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = dta_for_plot |>
+      distinct(state_abb, state_median_nidStorage),
+    aes(state_median_nidStorage, state_abb, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  # scale_x_continuous(label = label_number(scale_cut = cut_short_scale())) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") + #guide_legend(position = "inside")) +
+  # theme(legend.position.inside = c(0.75, 0.15)) +
+  coord_cartesian(xlim = c(1, 1e6)) +
+  labs(
+    subtitle = "B. nidStorage<br>",
+    y = NULL
+  )
+
+p3_surface_area_nidStorage_by_state <- dta_for_plot |>
+  ggplot() +
+  geom_density_ridges(
+    aes(area_to_volume_dam, state_abb, fill = region_label),
+    rel_min_height = 0.005,
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = dta_for_plot |>
+      distinct(state_abb, state_median_area_to_vol),
+    aes(state_median_area_to_vol, state_abb, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  # scale_x_continuous(label = label_number(scale_cut = cut_short_scale())) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") + #guide_legend(position = "inside")) +
+  # theme(legend.position.inside = c(0.75, 0.15)) +
+  coord_cartesian(xlim = c(0.001, 1)) +
+  labs(
+    subtitle = "C. surfaceArea / nidStorage<br>",
+    y = NULL
+  )
+
+p4_n_dams_by_state <- dta_for_plot |>
+  reframe(n = n(),
+          .by = c(state_abb, region_label)) |>
+  ggplot() +
+  geom_col(
+    aes(n, state_abb, fill = region_label),
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") +
+  labs(
+    subtitle = "D. Number of dams",
+    x = "n dams with surfaceArea\nand nidStorage values",
+    y = NULL
+  )
+
+my_layout <-
+c("
+ABCD")
+
+p1_surfaceArea_by_state + p2_nidStorage_by_state + 
+  p3_surface_area_nidStorage_by_state + p4_n_dams_by_state +
+  plot_annotation(
+    title = "Distributions by state: surfaceArea, nidStorage, and surfaceArea / nidStorage",
+    subtitle = glue("Red indicator is median for each subplot. All rows sorted by median surfaceArea.",
+                    "\nX axis in panels A-C are on log10 scale.<br>"),
+    caption = my_caption_nid_opentopography
+  ) +
+  plot_layout(design = my_layout) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: @fig-distributions-of-surfaceArea-and-nidStorage-by-state-facet-by-nidHeightId:
+
+Faceting by `nidHeightId` shows the distributions of the largest dams "Greater than 100 ft" have the most variation in the distributions. This is due in part to the much larger `nidHeight` range in this category (~101 to ~800 ft).
+
+```{r}
+#| label: fig-distributions-of-surfaceArea-and-nidStorage-by-state-facet-by-nidHeightId
+#| fig-cap: "Distribution of surfaceArea and nidStorage in each state"
+#| fig-width: 12
+#| fig-height: 12
+#| column: page-right
+
+dta_for_plot <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  mutate(state_median_surfaceArea = median(surfaceArea),
+         state_median_nidStorage = median(nidStorage),
+         state_median_area_to_vol = median(area_to_volume_dam),
+         .by = state_abb) |>
+  mutate(state_abb = fct_reorder(state_abb, state_median_surfaceArea))
+
+p1_surfaceArea_by_state <- dta_for_plot |>
+  ggplot() +
+  geom_density_ridges(
+    aes(surfaceArea, state_abb, fill = region_label),
+    rel_min_height = 0.005,
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = dta_for_plot |>
+      distinct(state_abb, state_median_surfaceArea),
+    aes(state_median_surfaceArea, state_abb, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  # guides(fill = guide_legend(position = "inside")) +
+  guides(fill = "none") + #guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.75, 0.15),
+        strip.text = element_text(size = rel(0.75))) +
+  facet_wrap(~ nidHeightId, nrow = 1) +
+  labs(
+    subtitle = "A. surfaceArea<br>",
+    y = NULL
+  )
+
+p2_nidStorage_by_state <- dta_for_plot |>
+  ggplot() +
+  geom_density_ridges(
+    aes(nidStorage, state_abb, fill = region_label),
+    rel_min_height = 0.005,
+    linewidth = 0.1,
+    color = NA,
+    alpha = 0.5
+  ) +
+  geom_text(
+    data = dta_for_plot |>
+      distinct(state_abb, state_median_nidStorage),
+    aes(state_median_nidStorage, state_abb, label = "^"),
+    size = 4,
+    alpha = 0.75,
+    color = "firebrick"
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  # scale_x_continuous(label = label_number(scale_cut = cut_short_scale())) +
+  scale_fill_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(fill = "none") + #guide_legend(position = "inside")) +
+  # theme(legend.position.inside = c(0.75, 0.15)) +
+  theme(strip.text = element_text(size = rel(0.75))) +
+  facet_wrap(~ nidHeightId, nrow = 1) +
+  coord_cartesian(xlim = c(1, 1e6)) +
+  labs(
+    subtitle = "B. nidStorage<br>",
+    y = NULL
+  )
+
+my_layout <-
+c("
+AB")
+
+p1_surfaceArea_by_state + p2_nidStorage_by_state + 
+  plot_annotation(
+    title = "Distribution of surfaceArea and nidStorage by nidHeightId - continental states",
+    subtitle = glue("Red indicator is median for all nidHeightId. All rows sorted by median surfaceArea.",
+                    " X axes are on log10 scale.<br>"),
+    caption = my_caption_nid_opentopography
+  ) +
+  plot_layout(design = my_layout) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: @fig-h2-visualization:
+
+* This plot is helpful in exploring the relationship between `surfaceArea` and `nidStorage`.
+
+* There appear to be data errors, data entry errors, or estimation heuristics at play at small `surfaceArea` values around 1 acre (see horizontal lines in panel A).
+
+* Otherwise, there appears to be near-linear relationships between `surfaceArea` and `nidStorage`, implying that dams generally have a similar "shape": they grow in `surfaceArea` as `nidStorage` grows.
+
+```{r}
+#| label: fig-h2-visualization
+#| fig-cap: "surfaceArea by nidStorage - all dams"
+#| fig-width: 8
+#| fig-height: 6
+#| column: page-right
+
+p1 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(nidStorage, surfaceArea, color = nidHeightId, group = nidHeightId)) +
+  geom_point(
+    size = 0.25,
+    alpha = 0.25
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = "none") +
+  labs(
+    subtitle = "A. storage_area / nidStorage<br>",
+    x = "nidStorage (log10 scale)",
+    y = "surfaceArea (log10 scale)"
+  )
+
+p2 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(nidStorage, surfaceArea, color = nidHeightId, group = nidHeightId)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.5,
+    # size = 0.25,
+    alpha = 0.8,
+    se = FALSE) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  theme(legend.position.inside = c(0.35, 0.85)) +
+  labs(
+    subtitle = "B. Regression line plot (same data)<br>",
+    x = "nidStorage (log10 scale)",
+    y = NULL
+  )
+
+p1 + p2 + 
+  plot_annotation(
+    title = "surfaceArea by nidStorage - all dams",
+    # subtitle = "REPLACE ME<br>",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+#### Model mod.h2.1 {#sec-h2-mod1}
+
+The model mod.h2.1 has some explanatory power. $R^2$ = 0.38.
+
+$$mod.h2.1: surfaceArea \sim nidStorage$$
+
+```{r}
+#| label: lm-surface_area-explained-by-nidStorage
+
+mod.h2.1 <- dta_for_model |>
+  lm(surfaceArea ~ nidStorage,
+       data = _)
+
+summary(mod.h2.1)
+       
+```
+
+<br>
+
+#### Model mod.h2.2 {#sec-h2-mod2}
+
+The model mod.h2.2 has some explanatory power. $R^2$ = 0.39 (which is less improvement over mod.h2.1 than I expected). So there isn't really a state-level effect on the ratio $surfaceArea::nidStorage$.
+
+$$mod.h2.2: surfaceArea \sim nidStorage | state$$
+
+```{r}
+#| label: lm-tri-surfaceArea-explained-by-nidStorage-by-state
+
+mod.h2.2 <- dta_for_model |>
+  mutate(surfaceArea_scaled = scale(surfaceArea),
+         nidStorage_scaled = scale(nidStorage)) |>
+  lmer(surfaceArea ~ nidStorage_scaled + state_abb + (1 | state_abb),
+       data = _)
+
+summary(mod.h2.2)
+       
+r_squared <- rsq(mod.h2.2)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 2)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 2)}", 
+     " and random effects: {round(r_squared$random, digits = 2)}"
+  )
+
+```
+
+<br>
+
+### Second: exploring the relationship among tri_mean<sub>sample</sub>, `sufaceArea`, and `nidStorage` {#sec-plots-tri-mean-sample}
+
+#### Plots
+
+Of note re: @fig-tri-mean-sample-by-surfaceArea:
+
+* The near-vertical nature of the categories in panel A indicate that there is no strong relationship between $tri\_mean_{sample}$ and `surfaceArea`.
+
+* One could tell a story from panel B if the model explained a lot of the variability (which is not likely given panel A). Regression  *sec-h3-mod1 Model 1* confirms this. Only when we adjust for state does the model capture some of the variability: *sec-h3-mod4 Model 4*.
+
+  - The more `surfaceArea`, the lower the $tri\_mean_{sample}$ (panel B). This makes some sense, since lakes behind dams are flat, resulting in lower $tri\_mean_{sample}$.
+
+  - The regression lines are somewhat parallel: in general, for any `surfaceArea` value, the higher the `nidHeightId`, the higher the $tri\_mean_{sample}$.
+
+```{r}
+#| label: fig-tri-mean-sample-by-surfaceArea
+#| fig-cap: "tri_mean<sub>sample</sub> by surfaceArea"
+#| fig-width: 8
+#| fig-height: 6
+#| column: page-right
+
+p1 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(surfaceArea, tri_mean_sample, color = nidHeightId, group = nidHeightId)) +
+  geom_point(
+    size = 0.25,
+    alpha = 0.25
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  # scale_y_continuous(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = "none") +
+  coord_cartesian(ylim = c(0.1, 100)) +
+  labs(
+    subtitle = "A. Scatter plot<br>",
+    x = "surface_area (log10 scale)",
+    y = "tri_mean_sample (log10 scale)"
+  )
+
+p2 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(surfaceArea, tri_mean_sample, color = nidHeightId, group = nidHeightId)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.5,
+    # size = 0.25,
+    alpha = 0.8,
+    se = FALSE) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  theme(legend.position.inside = c(0.75, 0.2),
+        legend.background = element_rect(fill = "transparent")) +
+  coord_cartesian(ylim = c(0.1, 100)) +
+  labs(
+    subtitle = "B. Regression line plot (same data)<br>",
+    x = "surface_area (log10 scale)",
+    y = NULL
+  )
+
+p1 + p2 + 
+  plot_annotation(
+    title = "tri_mean<sub>sample</sub> by surfaceArea<br>for local areas around dams",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: @fig-tri-mean-sample-by-nidStorage:
+
+* It looks like there is a data entry artifact at `nidStorage` = 100 among small dams (the vertical line in panel A). The people estimating `nidStorage` probably use 100 acre-feet as a handy guestimate.
+
+* Like with `surfaceArea` in plot @fig-tri-mean-sample-by-surfaceArea, the near-vertical nature of the categories in panel A indicate that there is no strong relationship between $tri\_mean_{sample}$ and `surfaceArea`.
+
+* One could tell a story from panel B if the model explained a lot of the variability. Regression *sec-h3-mod2 Model 2* confirms this. Only when we adjust for state does the model capture some of the variability: *sec-h3-mod5 Model 5*
+
+  - The more `nidStorage`, the lower the $tri\_mean_{sample}$ (panel B). This makes some sense, since `surfaceArea` grows as `nidStorage` grows (@fig-h2-visualization), and lakes behind dams are flat, resulting in lower $tri\_mean_{sample}$.
+
+  - The regression lines are somewhat parallel: in general, for any `surfaceArea` value, the higher the `nidHeightId`, the higher the $tri\_mean_{sample}$.
+
+```{r}
+#| label: fig-tri-mean-sample-by-nidStorage
+#| fig-cap: "tri_mean<sub>sample</sub> by nidStorage<br>for local areas around dams"
+#| fig-width: 8
+#| fig-height: 6
+#| column: page-right
+
+p1 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage),
+         nidStorage >= 1) |>
+  ggplot(aes(nidStorage, tri_mean_sample, color = nidHeightId, group = nidHeightId)) +
+  geom_point(
+    size = 0.25,
+    alpha = 0.25
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = "none") +
+  coord_cartesian(ylim = c(0.1, 100)) +labs(
+    subtitle = "A. Scatter plot",
+    x = "nidStorage (log10 scale)",
+    y = "tri_mean_sample (log10 scale)"
+  )
+
+p2 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage),
+         nidStorage >= 1) |>
+  ggplot(aes(nidStorage, tri_mean_sample, color = nidHeightId, group = nidHeightId)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.5,
+    alpha = 0.8,
+    se = FALSE) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  theme(legend.position.inside = c(0.75, 0.2),
+        legend.background = element_rect(fill = "transparent")) +
+  coord_cartesian(ylim = c(0.1, 100)) +labs(
+    subtitle = "B. Regression line plot (same data)<br>",
+    x = "nidStorage (log10 scale)",
+    y = NULL
+  )
+
+p1 + p2 + 
+  plot_annotation(
+    title = "tri_mean<sub>sample</sub> by nidStorage<br>for local areas around dams",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: @fig-tri-mean-sample-and-surfaceArea-to-nidstorage :
+
+The plots below using $surfaceArea::nidStorage$ are similar to those above, and the same conclusions apply.
+
+* Panel A suggests no meaningful relationship between $tri\_mean_{sample}$ and $\frac{surfaceArea}{nidStorage}$ 
+
+* One could tell a story from panel B if the model explained a lot of the variability (which is not likely given panel A). Regression in *@sec-h3-mod3 Model 3* confirm this.
+
+  - The regression lines are somewhat parallel: in general, for any $surfaceArea::nidStorage$ ratio, the higher the `nidHeightId`, the higher the $tri\_mean_{sample}$.
+
+```{r}
+#| label: fig-tri-mean-sample-and-surfaceArea-to-nidstorage
+#| fig-cap: "tri_mean<sub>sample</sub> by surfaceArea::nidStorage<br>for local areas around dams"
+#| fig-width: 8
+#| fig-height: 6
+#| column: page-right
+
+p1 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(area_to_volume_dam, tri_mean_sample, color = nidHeightId, group = nidHeightId)) +
+  geom_point(
+    size = 0.25,
+    alpha = 0.25
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = "none") +
+  coord_cartesian(ylim = c(0.1, 100)) +
+  labs(
+    subtitle = "A. Scatter plot<br>",
+    x = "surface_area::nidStorage (log10 scale)",
+    y = "tri_mean_saample (log10 scale)"
+  )
+
+p2 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(area_to_volume_dam, tri_mean_sample, color = nidHeightId, group = nidHeightId)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.5,
+    alpha = 0.8,
+    se = FALSE) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  theme(legend.position.inside = c(0.75, 0.2),
+        legend.background = element_rect(fill = "transparent")) +
+  coord_cartesian(ylim = c(0.1, 100)) +
+  labs(
+    subtitle = "B. Regression line plot (same data)<br>",
+    x = "surface_area::nidStorage (log10 scale)",
+    y = NULL
+  )
+
+p1 + p2 + 
+  plot_annotation(
+    title = "tri_mean<sub>sample</sub> by surfaceArea::nidStorage<br>for local areas around dams",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+#### Regression models
+
+Given my observations about @fig-tri-mean-sample-and-surfaceArea-to-nidstorage, and the fact that all three of the above plots have "vertical" features in the scatter plots, doubt there is a real relationship with $tri\_mean_{sample}$. I explore only the best-performing model used in $H_3$: *@sec-h3-mod5 Model 5*, which has $R^2$ = 0.50 (but that's not very good given *@sec-h3-mod6 Model 6* using only state_abb has $R^2$ = 0.42). 
+
+##### Model mod.h2.3 {#sec-h2-mod3}
+
+Model mod.h2.3 $R^2$ = 0.49 (which is better than I expected).
+
+$$mod.h2.3: tri\_mean_{dam} \sim nidstorage | state$$ 
+
+```{r}
+#| label: lm-tri-mean-sample-explained-by-nidStorage-by-state
+
+mod.h2.3 <- dta_for_model |> 
+  mutate(tri_mean_sample_scaled = scale(tri_mean_sample),
+         nidStorage_scaled = scale(nidStorage)) |>
+  lmer(tri_mean_sample_scaled ~ nidStorage_scaled + state_abb + (1 | state_abb),
+     data = _)
+
+summary(mod.h2.3)
+
+r_squared <- rsq(mod.h2.3)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 2)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 2)}", 
+     " and random effects: {round(r_squared$random, digits = 2)}"
+  )
+
+```
+
+<br>
+
+### Conclusion: H<sub>2</sub>
+
+The plots in @sec-plots-tri-mean-sample, in particular the near-vertical nature of the categories in the scatter plots indicate that there is no strong relationship between $tri\_mean_{sample}$ or $tri\_mean_{dam}$) and either `surfaceArea`, `nidStorage`, or $surfaceArea::nidStorage$
+
+For this reason I minimized my time investment by modeling only the one regression with the most promise (after exploring it in $H_3$). It wasn't helpful.
+
+In other words, $H_2$ is not supported by the data.
+
+<br>
+
+## Exploring H<sub>3</sub> : Compared to H<sub>2</sub> there is a stronger inverse proportional relationship between ruggeness in the local areas around dams and surfaceArea::nidStorage {#sec-h3-explore}
+
+This seems intuitive when compared to $H_2$: dams are built where the topography provides good places to hold water, and where terrain is more rugged and thus the hills steeper, the basins holding water are likely to be deeper.
+
+### Plots
+
+Of note re: @fig-tri-mean-dam-by-surfaceArea:
+
+* Both panels show that dams with higher surface area tend to have lower $tri\_mean_{dam}$, and the higher the `nidHeightId`, the higher the $tri\_mean_{dam}$.
+
+* Compared to $H_2$'s @fig-tri-mean-sample-by-surfaceArea, @fig-tri-mean-dam-by-surfaceArea does seem to show some relationship in panel A. See regression *@sec-h3-mod1 Model 1*.
+
+```{r}
+#| label: fig-tri-mean-dam-by-surfaceArea
+#| fig-cap: "tri_mean<sub>dam</sub> by surfaceArea"
+#| fig-width: 8
+#| fig-height: 6
+#| column: page-right
+
+p1 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(surfaceArea, tri_mean_dam, color = nidHeightId, group = nidHeightId)) +
+  geom_point(
+    size = 0.25,
+    alpha = 0.25
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = "none") +
+  coord_cartesian(ylim = c(0.1, 100)) +
+  labs(
+    subtitle = "A. Scatter plot<br>",
+    x = "surface_area (log10 scale)",
+    y = "tri_mean_dam (log10 scale)"
+  )
+
+p2 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(surfaceArea, tri_mean_dam, color = nidHeightId, group = nidHeightId)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.5,
+    # size = 0.25,
+    alpha = 0.8,
+    se = FALSE) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  theme(legend.position.inside = c(0.75, 0.2)) +
+  coord_cartesian(ylim = c(0.1, 100)) +
+  labs(
+    subtitle = "B. Regression line plot (same data)<br>",
+    x = "surface_area (log10 scale)",
+    y = NULL
+  )
+
+p1 + p2 + 
+  plot_annotation(
+    title = "tri_mean<sub>dam</sub> by surfaceArea<br>for local areas around dams",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: @fig-tri-mean-dam-by-nidStorage:
+
+* There is a similar story for `nidStorage`: dams with higher `nidStorage` tend to have lower $tri\_mean_{dam}$, and the higher the `nidHeightId`, the higher the $tri\_mean_{dam}$.
+
+* It looks like there is a data entry artifact at `nidStorage` = 100 among small dams (the vertical line in panel A). People estimating `nidStorage` probably use 100 acre-feet as a handy guestimate.
+
+* Compared to $H_2$'s @fig-tri-mean-sample-by-nidStorage, @fig-tri-mean-dam-by-nidStorage does seem to show some relationship in panel A. See regression *@sec-h3-mod2 Model 2*.
+
+```{r}
+#| label: fig-tri-mean-dam-by-nidStorage
+#| fig-cap: "tri_mean<sub>dam</sub> by nidStorage<br>for local areas around dams"
+#| fig-width: 8
+#| fig-height: 6
+#| column: page-right
+
+p1 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage),
+         nidStorage >= 1) |>
+  ggplot(aes(nidStorage, tri_mean_dam, color = nidHeightId, group = nidHeightId)) +
+  geom_point(
+    size = 0.25,
+    alpha = 0.25
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = "none") +
+  coord_cartesian(ylim = c(0.1, 100)) +labs(
+    subtitle = "A. Scatter plot",
+    x = "nidStorage (log10 scale)",
+    y = "tri_mean_dam (log10 scale)"
+  )
+
+p2 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage),
+         nidStorage >= 1) |>
+  ggplot(aes(nidStorage, tri_mean_dam, color = nidHeightId, group = nidHeightId)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.5,
+    # size = 0.25,
+    alpha = 0.8,
+    se = FALSE) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  theme(legend.position.inside = c(0.75, 0.2)) +
+  coord_cartesian(ylim = c(0.1, 100)) +labs(
+    subtitle = "B. Regression line plot (same data)<br>",
+    x = "nidStorage (log10 scale)",
+    y = NULL
+  )
+
+p1 + p2 + 
+  plot_annotation(
+    title = "tri_mean<sub>dam</sub> by nidStorage<br>for local areas around dams",
+    caption = my_caption_nid_opentopography_self_only
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+Of note re: @fig-tri-mean-dam-and-surfaceArea-to-nidstorage:
+
+Results are the same as when using $tri\_mean_{sample}$ in @fig-tri-mean-sample-and-surfaceArea-to-nidstorage above to explore $H_2$.
+
+* Panel A suggests there is no meaningful relationship between $tri\_mean_{dam}$ and $\frac{surfaceArea}{nidStorage}$ 
+
+* One could tell a story from panel B if the model explained a lot of the variability (which is not likely given panel A). Regressions in *sec-h3-mod6 Model 6* confirm this.
+
+  - The regression lines are somewhat parallel: in general, for any `surfaceArea::nidStorage` ratio, the higher the `nidHeightId`, the higher the $tri\_mean_{sample}$.
+
+```{r}
+#| label: fig-tri-mean-dam-and-surfaceArea-to-nidstorage
+#| fig-cap: "tri_mean<sub>dam</sub> by surfaceArea::nidStorage<br>for local areas around dams"
+#| fig-width: 8
+#| fig-height: 6
+#| column: page-right
+
+p1 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(area_to_volume_dam, tri_mean_dam, color = nidHeightId, group = nidHeightId)) +
+  geom_point(
+    size = 0.25,
+    alpha = 0.25
+  ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = "none") +
+  coord_cartesian(ylim = c(0.1, 100)) +
+  labs(
+    subtitle = "A. Scatter plot<br>",
+    x = "surface_area::nidStorage (log10 scale)",
+    y = "tri_mean_dam (log10 scale)"
+  )
+
+p2 <- dta_for_model |>
+  filter(!is.na(surfaceArea),
+         !is.na(nidStorage)) |>
+  ggplot(aes(area_to_volume_dam, tri_mean_dam, color = nidHeightId, group = nidHeightId)) +
+  geom_smooth(
+    method = 'gam',
+    formula = y ~ s(x, bs = "cs"),
+    linewidth = 0.5,
+    alpha = 0.8,
+    se = FALSE) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_y_log10(label = label_number(scale_cut = cut_short_scale())) +
+  scale_color_manual(values = c("firebrick", "darkslategrey", "blue", "skyblue")) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  theme(legend.position.inside = c(0.75, 0.2)) +
+  coord_cartesian(ylim = c(0.1, 100)) +
+  labs(
+    subtitle = "B. Regression line plot (same data)<br>",
+    x = "surface_area::nidStorage (log10 scale)",
+    y = NULL
+  )
+
+p1 + p2 + 
+  plot_annotation(
+    title = "tri_mean<sub>dam</sub> by surfaceArea::nidStorage<br>for local areas around dams",
+    caption = my_caption_nid_opentopography
+  ) &
+  theme(plot.title = element_textbox_simple(),
+        plot.subtitle = element_textbox_simple())
+
+```
+
+<br>
+
+### Regression models
+
+#### Model mod.h3.1 {#sec-h3-mod1}
+
+The model mod.h3.1 has no explanatory power. $R^2$ is effectively zero.
+
+$$mod.h3.1: tri\_mean_{dam} \sim surfaceArea$$
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-surfaceArea
+
+mod.h3.1 <- dta_for_model |>
+  lm(tri_mean_dam ~ surfaceArea,
+     data = _)
+
+summary(mod.h3.1)
+
+```
+
+<br>
+
+#### Model mod.h3.2 {#sec-h3-mod2}
+
+Similarly, the model mod.h3.2 has no explanatory power. $R^2$ is effectively zero.
+
+$$mod.h3.2: tri\_mean_{dam} \sim nidStorage$$
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-nidStorage
+
+mod.h3.2 <- dta_for_model |>
+  lm(tri_mean_dam ~ nidStorage,
+     data = _)
+
+summary(mod.h3.2)
+
+```
+
+<br>
+
+#### Model mod.h3.3 {#sec-h3-mod3}
+
+The model mod.h3.3 has no explanatory power. $R^2$ is effectively zero and, accordingly, the $p$ value is very high.
+
+$$mod.h3.3: tri\_mean_{dam} \sim ratio$$ 
+
+where $ratio = \frac{surfaceArea}{nidStorage}$.
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-ratio
+
+mod.h3.3 <- dta_for_model |>
+  lm(tri_mean_dam ~ area_to_volume_dam,
+     data = _)
+
+summary(mod.h3.3)
+
+```
+
+<br>
+
+#### Model mod.h3.4 {#sec-h3-mod4}
+
+Adjusting for state in a linear mixed model offers more explanatory power: mod.h3.4 $R^2$ = 0.47.
+
+$$mod.h3.4: tri\_mean_{dam} \sim surfaceArea | state$$
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-surfaceArea-by-state
+
+mod.h3.4 <- dta_for_model |> # dams_with_tri |>
+  mutate(tri_mean_dam_scaled = scale(tri_mean_dam),
+         surfaceArea_scaled = scale(surfaceArea)) |>
+  lmer(tri_mean_dam_scaled ~ surfaceArea_scaled + state_abb + (1 | state_abb),
+     data = _)
+
+summary(mod.h3.4)
+
+r_squared <- rsq(mod.h3.4)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 2)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 2)}", 
+     " and random effects: {round(r_squared$random, digits = 2)}"
+  )
+
+```
+
+<br>
+
+#### Model mod.h3.5 {#sec-h3-mod5}
+
+A similar mod.h3.5 has slightly better results: $R^2$ = 0.50.
+
+$$mod.h3.5: tri\_mean_{dam} \sim nidstorage | state$$ 
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-nidStorage-by-state
+
+mod.h3.5 <- dta_for_model |> # dams_with_tri |>
+  mutate(tri_mean_dam_scaled = scale(tri_mean_dam),
+         nidStorage_scaled = scale(nidStorage)) |>
+  lmer(tri_mean_dam_scaled ~ nidStorage_scaled + state_abb + (1 | state_abb),
+     data = _)
+
+summary(mod.h3.5)
+
+r_squared <- rsq(mod.h3.5)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 2)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 2)}", 
+     " and random effects: {round(r_squared$random, digits = 2)}"
+  )
+
+```
+
+<br>
+
+#### Model mod.h3.6 {#sec-h3-mod6}
+
+The model mod.h3.6 has some explanatory power. $R^2$ = 0.42, however, it explains less variation than the two models above using `surfaceArea` and `nidStorage` as separate predictors.
+
+$$mod.h3.6: tri\_mean_{dam} \sim ratio | state$$
+
+where $ratio = \frac{surfaceArea}{nidStorage}$
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-ratio-by-state
+
+# mod6 <- dta_for_model |>
+#   lmer(tri_mean_dam ~ area_to_volume_dam + (1 | state_abb),
+#      data = _)
+
+mod.h3.6 <- dta_for_model |>
+  mutate(tri_mean_dam_scaled = scale(tri_mean_dam),
+         area_to_volume_dam_scaled = scale(area_to_volume_dam)) |>
+  lmer(tri_mean_dam_scaled ~ area_to_volume_dam_scaled + state_abb + (1 | state_abb),
+       data = _)
+
+summary(mod.h3.6)
+       
+r_squared <- rsq(mod.h3.6)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 2)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 2)}", 
+     " and random effects: {round(r_squared$random, digits = 2)}"
+  )
+
+```
+
+<br>
+
+#### Model mod.h3.7 {#sec-h3-mod7}
+
+mod.h3.7 uses only state effects. $R^2$ = 0.40.
+
+```{r}
+#| label: lm-tri-mean-dam-explained-by-state
+
+mod.h3.7 <- dta_for_model |>
+  mutate(tri_mean_dam_scaled = scale(tri_mean_dam)) |>
+  lmer(tri_mean_dam_scaled ~  1 | state_abb,
+       data = _)
+
+summary(mod.h3.7)
+       
+r_squared <- rsq(mod.h3.7)
+
+rsq_comment <- glue(
+  "r_squared: {round(r_squared$model, digits = 2)}", 
+     "\nconsisting of fixed effects: {round(r_squared$fixed, digits = 2)}", 
+     " and random effects: {round(r_squared$random, digits = 2)}"
+  )
+
+```
+
+<br>
+
+### Conclusion: H<sub>3</sub>
+
+Plots re: $tri\_mean_{dam}$ are similar to those when using $tri\_mean_{sample}$ in @fig-tri-mean-sample-and-surfaceArea-to-nidstorage above to explore $H_2$. See @fig-tri-mean-dam-and-surfaceArea-to-nidstorage.
+
+The near-vertical nature of the categories in the scatter plots indicate that there is no strong relationship between $tri\_mean_{sample}$ or $tri\_mean_{dam}$) and either `surfaceArea`, `nidStorage`, or $surfaceArea::nidStorage$. 
+
+I explored seven regression models. None strenghen the case for $H_3$. 
+
+In other words, $H_3$ is not supported by the data.
+
+<br>
+
+## Summary: insights from ruggedness
+
+$H_1$ is the only one of the three hypotheses supported by the data--and that only on a qualified basis. In flatter regions it's true that the areas around dams are more rugged than the median ruggedness. This is not true for mountainous regions, since dams are placed in valleys, which are flatter than the surrounding mountains. Additionally large dams create flatness by virtue of their lakes.
+
+$H_2$ and $H_3$ are disproved by the data. While `surfaceArea` and `nidStorage` are related (@fig-h2-visualization), the ratio $surfaceArea::nidStorage$ does not appear to have an association with ruggedness--either of the areas around dams ($tri\_mean_{dam}$) or around random points in the state ($tri\_mean_{sample}$).
+
+<br>

@@ -1,0 +1,112 @@
+# Introduction {#sec-intro}
+
+Having learned of the existence of the US National Inventory of Dams, I started wondering ...
+
+* How many dams are there? And where are they? 
+* Was there a peak dam building period in the USA?
+* What do the distributions by purpose, ownership, size, and state look like?
+* It seems to be a perennial challenge to adequately fund the ongoing maintenance of civil infrastructure, including roads, bridges and dams. Skimping on dam maintenance could create significant hazards. Are there large dams with high hazard potential and inadequate plans for emergencies?
+
+## Focus
+
+In this report I look at dams in the continental USA, excluding dikes, and levees. In order to put dams into the larger context of US civil infrastructure, I include infrastructure grades, funding and funding gap data published by the American Society of Civil Engineers.
+
+Going beyond the dams, I also look at their drainage area, waterways and watersheds, and land roughness around dams. Where I go deeper in a specific state, I typically pick North Carolina, the state where I live.
+
+<br>
+
+## Introducting the National Inventory of Dams (NID)
+
+The following is from the mission page on the NID web site^[<https://nid.sec.usace.army.mil/#/about-the-nid/mission> ].
+
+> The National Inventory of Dams (NID) is a congressionally authorized
+database that documents more than 91,000 dams across the U.S. and
+its territories. It is maintained and published by the U.S. Army Corps
+of Engineers, in cooperation with the Association of State Dam Safety
+Officials, the states, territories, and federal agencies.^[<https://nid.sec.usace.army.mil/assets/whatIsNid/nov-2021-factsheet.pdf> ] .... The National Inventory of Dams (NID) documents all known dams in the U.S. and its territories that meet certain criteria. It is designed to provide a variety of users the ability to search for specific data about dams in the U.S. and serves as a resource to support awareness of dams and actions to prepare for a dam-related emergency.  USACE is responsible for maintaining the NID and works in close collaboration with federal and state dam regulating agencies, the Federal Emergency Management Agency (FEMA) and the Association of State Dam Safety Officials, to obtain accurate and complete information about dams in the database. The database contains information about a dam’s location, type, size, purpose, uses and benefits, last inspection, other structural and geographical information, and much more (there are more than 70 data fields for each dam). The NID is also used to assist federal, state, and local agencies developing dam safety policies ....
+> 
+> Information Available in the NID
+> 
+> Since transitioning to a web-based platform, site visitors have been able to download or export certain data.  The NID is currently the only place to find and download national data at such a detailed level. Today, the database contains information for more than 91,000 dams that meet the following criteria:
+>
+> * Dams where a failure or mis-operation will likely result in loss of human life (high hazard potential).
+> 
+> * Dams where a failure or mis-operation would likely result in disruption of access to critical facilities, damage to public and private facilities, and require difficult mitigation efforts (significant hazard potential).
+> 
+> * Dams that meet minimum height and reservoir size requirements, even though they do not pose the same level of life or economic risk as those above – these dams are equal to or exceed 25 feet in height and exceed 15 acre-feet in storage, or equal to or exceeding 50 acre-feet in storage and exceeding 6 feet in height.
+> 
+> * The NID does not yet contain all dams in the U.S. that meet these criteria. Continued, routine updates to the NID and enhanced data collection efforts, focused on the most reliable data sources (primarily the many federal and state government dam regulatory programs), will help capture these dams and result in a more robust dataset over time....
+>
+> A common misconception is that the NID contains only dams that are large or pose a threat to human life. In reality, there are a wide variety of dams in the NID. For example, around two-thirds (60,000) of the dams in the NID do not pose life loss or economic risk (low hazard potential). Half of the NID dams are less than 25 feet in height, and only two percent of the dams are more than 100 feet tall.
+
+<br>
+
+## Definitions
+
+The following definitions are published by the US Society on Dams^[<https://www.ussdams.org/glossary/> ]
+
+* Dam: An artificial barrier that has the ability to impound water, wastewater, or any liquid-borne material, for the purpose of storage or control of water.
+
+* Dike: (1) (Engineering) An embankment to confine or control water, especially one built along the banks of a river to prevent overflow of lowlands; a levee. (2) A low wall that can act as a barrier to prevent a spill from spreading. (3) (Geology) A tabular body of igneous (formed by volcanic action) rock that cuts across the structure of adjacent rocks or cuts massive rocks.
+
+* Levee: A natural or man-made earthen barrier along the edge of a stream, river, or lake to prevent the flow of water out of its channel.
+
+<br> 
+
+The data set include many helpful variables. Definitions below are from the [National Inventory of Dams Data Dictionary](https://usace-cwbi-prod-il2-nld2-docs.s3-us-gov-west-1.amazonaws.com/ec51e2ba-daff-4dbe-95eb-af13b91066ba/NID%20Data%20Dictionary%202021-12-14.pdf) updated December 2021. Some with a "nid" prefix are worth explaining here:
+
+* `nidId`: The official NID identification number for the dam, known formerly as the National ID. This is a required
+field, and must have an entry for each dam included in the NID. The State Dam Safety Offices assign and
+maintain the NID IDs for all dams, regardless of ownership. The first two characters of the identity are the
+two-letter state abbreviation, based on the location of the dam. The last five to six characters of the identity are
+a unique number (AB#####); although States are allowed to use alphanumeric combinations in the characters
+that follow the state abbreviation.
+
+* `nidHieght`: Calculated field: Maximum value of dam height, structural height, and hydraulic height. Accepted as the
+general height of the dam.
+
+* `nidHeightId`: Calculated field: Based on the NID Height, grouped into categories: less than 25 feet, 25-49 feet, 50-100 feet,
+and greater than 100 feet.
+
+* `nidStorage` Calculated field: Maximum value of normal storage and maximum storage. Accepted as the general storage of the dam
+  - Maximum Storage: Maximum storage, in acre-feet, which is defined as the total storage space in a reservoir below the maximum
+attainable water surface elevation, including any surcharge storage.
+  - Normal Storage: Normal storage, in acre-feet, which is defined as the total storage space in a reservoir below the normal
+retention level, including dead and inactive storage and excluding any flood control or surcharge storage. For
+normally dry dams, the normal storage will be a zero value. If unknown, the value will be blank and not zero.
+
+`nidStorage` is the measurement of volume managed by the dam.
+
+Other useful numerical data include surfaceArea, maxDischarge, drainageArea, yearCompleted, and yearsModified.
+
+<br>
+
+## Acknowledgements
+
+The U.S. Army Corps of Engineers maintains the National Inventory of Dams and publishes it at <https://nid.sec.usace.army.mil/#/> .
+
+I reuse some definitions from the [US Society on Dams](https://www.ussdams.org/glossary/).
+
+The American Society for Civil Engineers publishes an [infrastructure report card](https://infrastructurereportcard.org/cat-item/dams-infrastructure), including the [2025 report summary](https://infrastructurereportcard.org/wp-content/uploads/2025/03/Dams.pdf), and [2025 full report](https://infrastructurereportcard.org/wp-content/uploads/2025/03/Full-Report-2025-Natl-IRC-WEB.pdf).
+
+River shape files are published by the [National Weather Service National Operational Hydrologic Remote Sensing Center](https://www.nohrsc.noaa.gov/gisdatasets/) which I downloaded from <https://www.weather.gov/gis/Rivers> .
+
+Using the [osmdata](https://github.com/ropensci/osmdata) package, I downloaded some dam and river data from [OpenStreetMap](https://www.openstreetmap.org/relation/148838#map=3/33.06/-115.31), which is licensed on the terms of the [Open Database License](http://www.opendatacommons.org/licenses/odbl/), "ODbL" 1.0.
+
+The [USABoundaries](https://ropensci.r-universe.dev/USAboundaries) package by Jacci Ziebert et al. provides easy access to current and historical boundaries. Kyle Walker's [tidycensus](https://walker-data.com/tidycensus/) package provide easy access to data from the US Census Bureau including population and other demographics along with boundaries data from the US Census Bureau's TIGER/Line shapefiles.
+
+The [elevatr](https://cran.r-project.org/web/packages/elevatr/index.html) package by Jeffrey Hollister et al. (which is [mirrored](https://github.com/usepa/elevatr) by the US Environmental Protection Agency) makes it easy to download Digital Elevation Model (DEM) data. The elevatr package gets data from the AWS [Open Data Terrain Tiles](https://registry.opendata.aws/terrain-tiles/), managed by Mapzen, a Linux Foundation project. I use [3DEP](https://www.usgs.gov/3d-elevation-program/about-3dep-products-services) data, specifically data from the NASA Shuttle RADAR Topography Mission ([SRTM](https://www.earthdata.nasa.gov/data/instruments/srtm)). The United States 3DEP (formerly NED) and SRTM terrain data are provided courtesy of the U.S. Geological Survey. 
+
+The rspacial packages [terra](https://rspatial.github.io/terra/index.html) and [sf](https://r-spatial.github.io/sf/index.html) do the GIS heavy lifting, as well as many [tidyverse](https://www.tidyverse.org) packages. I use a color scheme and other helpful functions from [Diego Hernangómez](https://dieghernan.github.io/tidyterra/authors.html)'s [tidyterra](https://dieghernan.github.io/tidyterra/index.html) .
+
+Thanks to Jeremy Singer-Vine for highlighting the National Inventory of Dams in his newsletter [Data Is Plural — 2025.05.14 edition](https://www.data-is-plural.com/archive/2025-05-14-edition/).
+
+<br>
+
+## Licensing
+
+<a href="https://dmoul.github.io/">A look at US dams</a> © 2026 by <a href="https://dmoul.github.io/">Daniel Moul</a> is licensed under <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a><img src="https://mirrors.creativecommons.org/presskit/icons/cc.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;"><img src="https://mirrors.creativecommons.org/presskit/icons/by.svg" alt="" style="max-width: 1em;max-height:1em;margin-left: .2em;">
+
+The source code creating this text can be found at <https://github.com/dmoul> and is offered under the MIT license.
+
+<br>

@@ -1,0 +1,2811 @@
+# Numbers {#sec-explore-numbers}
+
+```{r}
+#| label: setup
+#| include: false
+
+source(here::here("scripts/setup.R"))
+
+source(here::here("scripts/prepare-data.R"))
+```
+
+
+```{r}
+#| label: define-data-population-related
+
+###### Get state populations
+# v2020_pl <- load_variables(2020, "pl", cache = TRUE)
+# v2020_dp <- load_variables(2020, "dp", cache = TRUE)
+# v2020_dhc <- load_variables(2020, "dhc", cache = TRUE)
+
+pop2020_raw <- get_decennial(
+  geography = "state",
+  variables = "DP1_0001C", # "P001001",
+  year = 2020,
+  sumfile = "dp",
+  geometry = TRUE,
+  cb = TRUE,
+  resolution = "20m", # cartographic boundaries simplified
+  cache_table = TRUE
+) |>
+  clean_names()
+
+pop2020 <- pop2020_raw |>
+  filter(name != "Puerto Rico") |>
+  filter(!name %in% c("Alaska", "Hawaii", "District of Columbia")) |>
+  rename(pop = value) |>
+  mutate(
+    area = st_area(geometry),
+    area_sqmi = as.numeric(area) / 2589988.110336 #m^2 to mi^2
+  ) |>
+  left_join(us_state_data, by = join_by(name == state)) |>
+  mutate(area_diff_pct = area_sqmi / state_area) |>
+  filter(name != "District of Columbia")
+
+# continental_us_border <- st_union(pop2020)
+
+# bbox_continental <- continental_us_border |>
+#   st_bbox()
+
+dams_by_state_with_pop <- dams_by_state |>
+  left_join(
+    pop2020 |>
+      st_drop_geometry(),
+    by = join_by(state == name, state_abb == state_abb)
+  ) |>
+  left_join(wet, by = join_by(state == usgs_state)) |>
+  mutate(
+    #area_diff_pct2 = state_area / usgs_total_area_square_miles, # R value / USGS value
+    #area_diff_pct3 = area_sqmi / usgs_total_area_square_miles, # calculated area / USGS value
+    area_diff_pct4 = state_area / usgs_total_area_less_great_lakes, # R value / USGS value
+    area_diff_pct5 = area_sqmi / usgs_total_area_less_great_lakes # calculated area / USGS value
+  )
+
+###### prepare-ratio-data
+
+dams_with_pop <- dams_no_geo |>
+  st_drop_geometry() |>
+  select(
+    name,
+    nidId,
+    state,
+    nidStorage,
+    normalStorage,
+    nidHeight,
+    damLength,
+    surfaceArea,
+    drainageArea,
+    maxDischarge,
+    big_dam
+  ) |>
+  left_join(pop2020, by = join_by(state == name)) |>
+  left_join(wet, by = join_by(state == usgs_state))
+
+dams_ratios_per_state <- dams_with_pop |>
+  filter(nidId != "MI00650") |> # Correct for Soo Locks in Michigan
+  # NM average ratio is way out of proportion. These two have obvious errors in surfaceArea values
+  filter(
+    !nidId %in%
+      c(
+        "NM00039", # Encino Det Dam 083
+        "NM00047"
+      ) # Alamos Detention Dam
+  ) |>
+  reframe(
+    n_dams = n(),
+    sqmi_per_dam = first(area_sqmi) / n_dams,
+    pct_surface_area_dams = sum(surfaceArea, na.rm = TRUE) /
+      640 /
+      first(area_sqmi), # 640 acres/sqmi
+    # pct_of_water_area = sum(surfaceArea, na.rm = TRUE) / 640 / first(usgs_water_area_square_miles),
+    pop_per_dam = first(pop) / n_dams,
+    median_surface_area_to_nidStorage = median(
+      surfaceArea / nidStorage,
+      na.rm = TRUE
+    ),
+    avg_surface_area_to_nidStorage = mean(
+      surfaceArea / nidStorage,
+      na.rm = TRUE
+    ),
+    .by = state
+  ) |>
+  left_join(
+    us_state_data,
+    by = "state"
+  ) |>
+  mutate(
+    state = fct_reorder(state, n_dams),
+    state_abb = fct_reorder(state_abb, n_dams)
+  )
+
+dams_ratios_per_state_big <- dams_with_pop |>
+  filter(nidId != "MI00650") |> # Correct for Soo Locks in Michigan
+  filter(big_dam) |>
+  reframe(
+    n_dams = n(),
+    sqmi_per_dam = first(area_sqmi) / n_dams,
+    pct_surface_area_dams = sum(surfaceArea, na.rm = TRUE) /
+      640 /
+      first(area_sqmi), # 640 acres/sqmi
+    # pct_of_water_area = sum(surfaceArea, na.rm = TRUE) / 640 / first(usgs_water_area_square_miles),
+    pop_per_dam = first(pop) / n_dams,
+    median_surface_area_to_nidStorage = median(
+      surfaceArea / nidStorage,
+      na.rm = TRUE
+    ),
+    .by = state
+  ) |>
+  mutate(state = fct_reorder(state, n_dams))
+
+dams_ratios_per_state_distribution <- dams_with_pop |>
+  filter(nidId != "MI00650") |> # Correct for Soo Locks in Michigan
+  reframe(
+    name = name,
+    nidId = nidId,
+    surface_area_to_nidStorage = surfaceArea / nidStorage,
+    surfaceArea = surfaceArea,
+    normalStorage = normalStorage,
+    nidStorage = nidStorage,
+    state = state
+    # .by = state
+  )
+
+```
+
+<br>
+
+## Volume of water under management
+
+Perhaps the most important metric for dams is the amount of water^[Or in some cases, dams provide surface impoundment of mine tailings or coal ash. See for example Fact Sheet: Coal Ash. EPA 530-F-23-004. June 2023 at <https://www.epa.gov/system/files/documents/2023-06/CCR_Fact_Sheet_June_2023.pdf> 
+] stored by the dam. I think of this as "water under management". It's interesting to look at this by primary owner and primary purpose (@fig-purpose-owner-by-storage), and by state (@fig-state-storage).
+
+```{r}
+dta_for_storage <- dams_no_geo |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, nidStorage, yearCompleted, yearCompletedId) |>
+  filter(!is.na(nidStorage))
+
+storage_by_primary_purpose <- dta_for_storage |>
+  filter(nidId != "MI00650") |>
+  mutate(primaryOwnerTypeId = if_else(primaryOwnerTypeId == "Tribal Government",
+                                      "Other or not specified",
+                                      primaryOwnerTypeId)) |>
+  count(primaryPurposeId, primaryOwnerTypeId, wt = nidStorage) |>
+  mutate(primaryPurposeId = fct_reorder(primaryPurposeId, n, sum),
+         primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, n, sum))
+
+storage_by_primary_owner <- dta_for_storage |>
+  filter(nidId != "MI00650") |>
+  mutate(primaryOwnerTypeId = if_else(primaryOwnerTypeId == "Tribal Government",
+                                      "Other or not specified",
+                                      primaryOwnerTypeId)) |>
+  count(primaryOwnerTypeId, wt = nidStorage) |>
+  mutate(primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, n, sum))
+
+storage_by_state <- dta_for_storage |>
+  count(state, state_abb, wt = nidStorage) |>
+  mutate(state = fct_reorder(state, n),
+         state_abb = fct_reorder(state_abb, n)
+         )
+
+storage_by_state_mi_corrected <- dta_for_storage |>
+  filter(nidId != "MI00650") |>
+  count(state, state_abb, wt = nidStorage) |>
+  mutate(state = fct_reorder(state, n),
+         state_abb = fct_reorder(state_abb, n)
+         )
+
+```
+
+```{r}
+#| label: fig-purpose-owner-by-storage
+#| fig-cap: "`primaryPurpose` and `primaryOwner` by volume of water being managed (`nidStorage`)"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+p1 <- storage_by_primary_purpose |>
+  filter(primaryOwnerTypeId != "Tribal Government") |>
+  ggplot(aes(n, primaryPurposeId)) +
+  geom_col(aes(fill = primaryOwnerTypeId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.04))) +
+  scale_fill_viridis_d(end = 0.9) +
+  guides(fill = guide_legend(position = "inside",
+                             reverse =  TRUE)) +
+  theme(legend.position.inside = c(0.6, 0.4)) +
+  labs(
+    subtitle = "A: Primary purpose",
+    x = "acre ft",
+    y = NULL,
+    fill = "Primary owner"
+  )
+
+p2 <- storage_by_primary_owner |>
+  ggplot(aes(n, primaryOwnerTypeId)) +
+  geom_col() + #aes(fill = primaryPurposeId)) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.04))) +
+  labs(
+    subtitle = "B: Primary owner",
+    x = "acre ft",
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "Primary purpose and primary owner\nby amount of water under management (nidStorage)",
+    subtitle = "Continental USA. Michigan corrected",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+The amount of water under management by state needs a correction before we can use it. In @fig-state-storage panel A, Michigan is shown as having so much more water under management than other states because of one structure: [Soo Locks](https://en.wikipedia.org/wiki/Soo_Locks) in Sault Ste. Marie ([nidID MI00650](https://nid.sec.usace.army.mil/#/dams/system/MI00650/summary)), through which ships travel between Lake Superior and the other Great Lakes. Because of Soo Locks, Michigan "claims" nearly 278M acre-feet of water in Lake Superior. Removing this one structure in panel B moves Michigan down the ranking to 42 of 48 states. Where I'm not looking at `nidStorage`, I leave Soo Locks in the data sets. Where I remove it, the plot includes the note: "Michigan corrected".
+
+For other state-level data see @sec-state-level-data below.
+
+```{r}
+#| label: fig-state-storage
+#| fig-cap: "Volume of water under management by state (nidStorage)"
+#| fig-height: 10
+#| fig-width: 10
+#| column: page-right
+
+n_states <- nrow(storage_by_state)
+p1 <- storage_by_state |>
+  ggplot(aes(n, state)) +
+  geom_col() +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.04))) +
+  labs(
+    subtitle = glue("A: {n_states} states"),
+    x = "acre ft",
+    y = NULL
+  )
+
+p2 <- storage_by_state_mi_corrected |>
+  ggplot(aes(n, state)) +
+  geom_col() +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.04))) +
+  labs(
+    subtitle = glue("B: {n_states} states (Michigan corrected)"),
+    x = "acre ft",
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "State by amount of water under management (nidStorage)",
+    subtitle = "Continental USA",caption = my_caption
+  )
+
+```
+
+<br>
+
+## Other primary dam metrics {#sec-other-metrics}
+
+Primary dam metrics are log-normal-ish and vary over nearly seven orders of magnitude: `damHeight`, `damLength`, `maxDischarge`, `nidStorage`, `surfaceArea`, and `drainageArea` (@fig-dams-primary-metrics-histograms). The latter seems like it might be a composite of two log-normal distributions. Indeed, big dams seem to be supplying a distinct distribution (@fig-dams-primary-metrics-histograms-big-dam).
+
+```{r}
+#| label: fig-dams-primary-metrics-histograms
+#| fig-cap: "Histograms of primary dam metrics"
+#| fig-height: 8
+#| fig-width: 10
+#| column: page-right
+
+dta_for_plot <- dams |>
+  st_drop_geometry() |>
+  select(name, state, big_dam, nidId, nidStorage, nidHeight, damLength, surfaceArea, drainageArea, maxDischarge) |>
+  filter(nidId != "MI00650") |>
+  filter(damLength > 10)
+
+n_dams_allft <- nrow(dta_for_plot)
+
+dta_for_plot_long <- dta_for_plot |>
+  pivot_longer(
+    cols = nidStorage:maxDischarge,
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  filter(value > 0) |>
+  mutate(metric_label = case_match(
+    metric,
+    "damLength"        ~ "dam length (ft)",
+    "nidHeight"        ~ "dam height (ft)",
+    "drainageArea"     ~ "drainage area (mi^2)",
+    "maxDischarge"     ~ "max discharge (ft^3/sec)",
+    "surfaceArea"      ~ "surface area (acre)",
+    "nidStorage"       ~ "storage (acre-feet)",
+    .default = glue("error: {metric}")
+  ))
+
+dta_for_plot_medians = dta_for_plot_long |>
+  reframe(value = median(value),
+          n_dams = n(),
+          label_y = 0.3 * max(value, na.rm = TRUE),
+            .by = metric_label)
+
+dta_for_plot_long |>
+  ggplot() +
+  geom_histogram(aes(value),
+                 bins = 30,
+                 na.rm = TRUE) +
+  geom_vline(data = dta_for_plot_medians,
+             aes(xintercept = value),
+             lty = 2,
+             linewidth = 0.25,
+             alpha = 0.5,
+             na.rm = TRUE) +
+  geom_label(data = dta_for_plot_medians,
+            aes(x = Inf, y = Inf, label = glue("n = {n_dams}\nmedian = {round(value, digits = 1)}")),
+            hjust = 1, vjust = 1,
+            size = 3,
+            na.rm = TRUE
+            ) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale()),
+                expand = expansion(mult = c(0, 0.04))) +
+  facet_wrap(~metric_label, scales = "free_x") +
+  labs(
+    title = "Primary dam metrics ",
+    subtitle = glue("Includes the portion of the {n_dams_allft} dams that are not missing values, which varies by metric",
+                    "\nContinental USA. Michigan corrected."),
+    x = NULL,
+    y = "Number of dams",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+For big dams, `damHeight` and `maxDischarge` are one end of the distribution. The other big dam metric distributions are log-normal-ish.
+
+```{r}
+#| label:  fig-dams-primary-metrics-histograms-big-dam
+#| fig-cap: "Primary dam metrics for big dams"
+#| fig-height: 8
+#| fig-width: 10
+#| column: page-right
+
+dta_for_plot <- dams |>
+  st_drop_geometry() |>
+  select(name, state, big_dam, nidId, nidStorage, nidHeight, damLength, surfaceArea, drainageArea, maxDischarge) |>
+  filter(big_dam) |>
+  filter(nidId != "MI00650") |>
+  filter(damLength > 10)
+
+dta_for_plot_long <- dta_for_plot |>
+  pivot_longer(
+    cols = nidStorage:maxDischarge,
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  filter(value > 0) |>
+  mutate(metric_label = case_match(
+    metric,
+    "damLength"    ~ "dam length (ft)",
+    "nidHeight"    ~ "dam height (ft)",
+    "drainageArea" ~ "drainage area (mi^2)",
+    "maxDischarge" ~ "max discharge (ft^3/sec)",
+    "surfaceArea"  ~ "surface area (acre)",
+    "nidStorage"   ~ "storage (acre-feet)",
+    .default = glue("error: {metric}")
+  ))
+
+dta_for_plot_medians = dta_for_plot_long |>
+  reframe(value = median(value),
+          n_dams = n(),
+          .by = metric_label)
+
+n_dams_big <- nrow(dta_for_plot)
+
+dta_for_plot_long |>
+  ggplot() +
+  geom_histogram(aes(value),
+                 bins = 30) +
+  geom_vline(data = dta_for_plot_medians,
+             aes(xintercept = value),
+             lty = 2,
+             linewidth = 0.25,
+             alpha = 0.5) +
+  geom_label(data = dta_for_plot_medians,
+            aes(x = Inf, y = Inf, label = glue("n = {n_dams}\nmedian = {round(value, digits = 1)}")),
+            hjust = 1, vjust = 1,
+            size = 3) +
+  scale_x_log10(label = label_number(scale_cut = cut_short_scale())) +
+  facet_wrap(~metric_label, scales = "free_x") +
+  labs(
+    title = "Big dams: primary dam metrics",
+    subtitle = glue("Includes the portion of the {n_dams_big} dams that are not missing values, which varies by metric",
+                    "\nContinental USA. Michigan corrected."),
+    x = NULL,
+    y = "Number of dams",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+## Counts
+
+A plurality of dams are privately owned, for recreation, and made of earth (@fig-basic-counts).
+
+```{r}
+#| label: fig-basic-counts
+#| fig-cap: "Basic counts: owner, purpose, dam type"
+#| fig-height: 6
+#| fig-width: 10
+#| column: page-right
+
+p1 <- dams_no_geo |>
+  count(primaryOwnerTypeId) |>
+  mutate(primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, n),
+         n_pct = `n` / sum(`n`)) |>
+  ggplot(aes(n, primaryOwnerTypeId)) +
+  geom_col() +
+  geom_text(aes(x = 0.9 * max(n), label = glue("{n} | {percent(n_pct, accuracy = 1)}")),
+            hjust = 1,
+            size = 3) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    subtitle = "A: Primary owner type",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- dams_no_geo |>
+  count(primaryPurposeId) |>
+  mutate(primaryPurposeId = fct_reorder(primaryPurposeId, n),
+         n_pct = `n` / sum(`n`)) |>
+  ggplot(aes(n, primaryPurposeId)) +
+  geom_col() +
+  geom_text(aes(x = 0.9 * max(n), label = glue("{n} | {percent(n_pct, accuracy = 1)}")),
+            hjust = 1,
+            size = 3) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    subtitle = "B: Primary purpose",
+    x = NULL,
+    y = NULL
+  )
+
+p3 <- dams_no_geo |>
+  count(primaryDamTypeId) |>
+  mutate(primaryDamTypeId = fct_reorder(primaryDamTypeId, n),
+         n_pct = `n` / sum(`n`)) |>
+  ggplot(aes(n, primaryDamTypeId)) +
+  geom_col() + 
+  geom_text(aes(x = 0.9 * max(n), label = glue("{n} | {percent(n_pct, accuracy = 1)}")),
+            hjust = 1,
+            size = 3) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    subtitle = "C: Primary dam type",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 + p3 +
+  plot_annotation(
+    title = "Basic counts: owner, purpose, dam type",
+    caption = my_caption
+  ) & theme(plot.title.position = "plot")
+
+```
+
+<br>
+
+Big dam proportions differ from the set of all dams (@fig-basic-counts-big-dam) in the following ways:
+
+* A smaller proportion of big dams are privately owned (only 37% compared to 64%)
+* Recreation is not a major purpose. Instead flood risk control, water supply, and hydroelectric dominate the purposes (combined they are 60%)
+* There is more diversity in the dam type, since most small dams are made of earth
+
+```{r}
+#| label: fig-basic-counts-big-dam
+#| fig-cap: "Big dam basic counts: owner, purpose, dam type"
+#| fig-height: 6
+#| fig-width: 10
+#| column: page-right
+
+p1 <- dams_no_geo |>
+  filter(big_dam) |>
+  count(primaryOwnerTypeId) |>
+  mutate(primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, n),
+         n_pct = `n` / sum(`n`)) |>
+  ggplot(aes(n, primaryOwnerTypeId)) +
+  geom_col() +
+  geom_text(aes(x = 0.9 * max(n), label = glue("{n} | {percent(n_pct, accuracy = 1)}")),
+            hjust = 1,
+            size = 3) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    subtitle = "A: Primary owner type",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- dams_no_geo |>
+  filter(big_dam) |>
+  count(primaryPurposeId) |>
+  mutate(primaryPurposeId = fct_reorder(primaryPurposeId, n),
+         n_pct = `n` / sum(`n`)) |>
+  ggplot(aes(n, primaryPurposeId)) +
+  geom_col() +
+  geom_text(aes(x = 0.9 * max(n), label = glue("{n} | {percent(n_pct, accuracy = 1)}")),
+            hjust = 1,
+            size = 3) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    subtitle = "B: Primary purpose",
+    x = NULL,
+    y = NULL
+  )
+
+p3 <- dams_no_geo |>
+  filter(big_dam) |>
+  count(primaryDamTypeId) |>
+  mutate(primaryDamTypeId = fct_reorder(primaryDamTypeId, n),
+         n_pct = `n` / sum(`n`)) |>
+  ggplot(aes(n, primaryDamTypeId)) +
+  geom_col() + 
+  geom_text(aes(x = 0.9 * max(n), label = glue("{n} | {percent(n_pct, accuracy = 1)}")),
+            hjust = 1,
+            size = 3) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    subtitle = "C: Primary dam type",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 + p3 +
+  plot_annotation(
+    title = "Big dam basic counts: owner, purpose, dam type",
+    subtitle = "Includes dams with height > 100 ft",
+    caption = my_caption
+  ) & theme(plot.title.position = "plot")
+
+```
+
+<br>
+
+A matrix of `primaryPurpose` and `primaryOwner` make visible the most common combinations (@fig-count-by-ownertype-purpose).
+
+```{r}
+#| label: fig-count-by-ownertype-purpose
+#| fig-cap: "Primary purpose by primary owner type - count"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+owner_purpose <- dams |>
+  st_drop_geometry() |>
+  count(primaryOwnerTypeId, primaryPurposeId) |>
+  complete(primaryOwnerTypeId, primaryPurposeId, fill = list(n = 0)) |>
+  mutate(primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, -n, sum),
+         primaryPurposeId = fct_reorder(primaryPurposeId, n, sum))
+
+owner_purpose |>
+  ggplot(aes(x = primaryOwnerTypeId, y = primaryPurposeId)) +
+  geom_tile(aes(fill = n),
+            alpha = 0.98) +
+  geom_text(aes(label = n),
+            color = "white",
+             size = 3) +
+  theme(plot.title.position = "plot",
+        axis.text.x = element_text(angle = 60, hjust = 0)
+        ) +
+  scale_x_discrete(position = "top") +
+  scale_fill_continuous(transform = scales::transform_log1p(),
+                        breaks = c(0, 10, 100, 1000, 10000)) +
+  labs(
+    title = "Primary purpose by primary owner type - count",
+    x = "Primary owner",
+    y = "Primary purpose",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+The top ten combinations are shown below (@tbl-owner-purpose):
+
+```{r}
+#| label: tbl-owner-purpose
+
+owner_purpose |>
+  slice_max(order_by = n, n = 10) |>
+  mutate(idx = row_number()) |>
+  gt() |>
+  tab_options(table.font.size = 11) |>
+  tab_header(md("**Top 10 combinations of primary owner type and primary purpose**")) |>
+  cols_align(columns = c(starts_with("primary")),
+             align = "left") |>
+  fmt_number(columns = n,
+             decimals = 0)
+```
+
+<br>
+
+Large dams, by contrast, are mostly federally owned and for flood reduction, whereas local governments' dams are mostly for water supply, and public utility-owned dams are mostly for electricity generation (@fig-count-by-ownertype-purpose-big-dam).
+
+```{r}
+#| label: fig-count-by-ownertype-purpose-big-dam
+#| fig-cap: "Primary purpose by primary owner type - count"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+owner_purpose_big <- dams_no_geo |>
+  filter(big_dam) |> # only "big" dams
+  count(primaryOwnerTypeId, primaryPurposeId) |>
+  complete(primaryOwnerTypeId, primaryPurposeId, fill = list(n = 0)) |>
+  mutate(primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, -n, sum),
+         primaryPurposeId = fct_reorder(primaryPurposeId, n, sum))
+
+owner_purpose_big |>
+  ggplot(aes(x = primaryOwnerTypeId, y = primaryPurposeId)) +
+  geom_tile(aes(fill = n),
+            alpha = 0.98) +
+  geom_text(aes(label = n),
+            color = "white",
+             size = 3) +
+  theme(plot.title.position = "plot",
+        axis.text.x = element_text(angle = 60, hjust = 0)
+        ) +
+  scale_x_discrete(position = "top") +
+  scale_fill_continuous(transform = scales::transform_log1p(),
+                        breaks = c(0, 10, 100, 1000, 10000)) +
+  labs(
+    title = "Big dams: primary purpose by primary owner type - count",
+    subtitle = "'Big' dam defined as having height >= 100 ft",
+    x = "Primary owner",
+    y = "Primary purpose",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+The most common combinations for big dams are shown below:
+
+```{r}
+#| label: tbl-owner-purpose-big-dam
+
+owner_purpose_big |>
+  slice_max(order_by = n, n = 10) |>
+  mutate(idx = row_number()) |>
+  gt() |>
+  tab_options(table.font.size = 11) |>
+  tab_header(md("**Big dams: top 10 combinations of primary owner type and primary purpose**<br>Dams with height > 100 ft")) |>
+  cols_align(columns = c(starts_with("primary")),
+             align = "left") |>
+  fmt_number(columns = n,
+             decimals = 0)
+
+```
+
+<br>
+
+Alluvial plots provide a bird's eye view of counts of multiple properties. I go deeper into North Carolina dams in *@sec-owners-nc Owners in NC* exclusively using this kind of plot.
+
+```{r}
+#| label: fig-dam-alluvial
+#| fig-cap: "Dams by owner and purpose"
+#| fig-height: 10
+#| fig-width: 10
+#| column: page-right
+#| warning: false
+
+# following example at https://mjfrigaard.github.io/fm-ggp2/alluvial_charts.html
+
+dams_wide <- dams |>
+  st_drop_geometry() |>
+  # filter(nidHeightId == "Greater than 100 ft") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId) |>
+  filter(primaryOwnerTypeId != "Other or not specified",
+         primaryPurposeId != "Other or not specified") |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, 9)) |>
+  count(primaryOwnerTypeId, primaryPurposeId) |>
+  mutate(primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, n, sum),
+         primaryPurposeId = fct_reorder(primaryPurposeId, n, sum)
+  )
+
+p1 <- dams_wide |>
+  ggplot(aes(axis1 = primaryOwnerTypeId, 
+             axis2 = primaryPurposeId,
+             y = n)) +
+  scale_x_discrete(
+    limits = c("Owner", "Purpose"),
+    expand = c(0.1, 0.07),
+    position = "top") +
+  geom_alluvium(aes(fill = primaryPurposeId),
+                show.legend = FALSE) +
+  geom_stratum(linewidth = 0.05,
+               alpha = 0.8) +
+  geom_text(stat = "stratum",
+    aes(label = after_stat(stratum)),
+      size = 3) +
+  scale_fill_brewer(palette = "Paired") +
+  theme(axis.text.x = element_text(size = rel(2))) +
+  labs(
+    subtitle = "A. All dams",
+    y = NULL
+  )
+
+p1 +
+  plot_annotation(
+    title = "Dams in continental US by primary owner and primary purpose",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-dam-alluvial-big
+#| fig-cap: "Big dams by owner and purpose"
+#| fig-height: 10
+#| fig-width: 10
+#| column: page-right
+#| warning: false
+
+# following example at https://mjfrigaard.github.io/fm-ggp2/alluvial_charts.html
+
+big_dams_wide <- dams |>
+  st_drop_geometry() |>
+  select(nidId, big_dam, primaryOwnerTypeId, primaryPurposeId) |>
+  filter(big_dam, 
+         primaryOwnerTypeId != "Other or not specified",
+         primaryPurposeId != "Other or not specified") |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, 7)) |>
+  count(primaryOwnerTypeId, primaryPurposeId) |>
+  mutate(primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, n, sum),
+         primaryPurposeId = fct_reorder(primaryPurposeId, n, sum)
+  )
+
+p1 <- big_dams_wide |>
+  ggplot(aes(axis1 = primaryOwnerTypeId, 
+             axis2 = primaryPurposeId,
+             y = n)) +
+  scale_x_discrete(
+    limits = c("Owner", "Purpose"),
+    expand = c(0.1, 0.07),
+    position = "top") +
+  geom_alluvium(aes(fill = primaryPurposeId),
+                show.legend = FALSE) +
+  geom_stratum(linewidth = 0.05,
+               alpha = 0.8) +
+  geom_text(stat = "stratum",
+    aes(label = after_stat(stratum)),
+      size = 3) +
+  scale_fill_brewer(palette = "Paired") +
+  theme(axis.text.x = element_text(size = rel(2))) +
+  labs(
+    subtitle = "A. All dams",
+    y = NULL
+  )
+
+p1 +
+  plot_annotation(
+    title = "Big dams in continental US by primary owner and primary purpose",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+## Ratios {#sec-ratios}
+
+Ratios are one thing expressed as a multiple of the other, i.e., divided by the other. Let's look at `surfaceArea`::`nidStorage`. Dams built in hilly areas seem to me to be more likely to have low ratios of `surfaceArea` to `nidStorage`, i.e., the dams are likely to be deeper rather than broader. Can we substantiate or disprove this conjecture?
+
+First, some scatter plots in @fig-dam-dams-by-surface-area-per-state:
+
+* Panel A provides context: state population by area. 
+* Panel B plots the number dams in each state by state area. 
+* Panel C plots number of dams in the state by state population. 
+* And panel D plots dam storage (nidStorage) by number of dams in the state. 
+
+In each plot one or more regional clusters are visible. 
+
+```{r}
+#| label: fig-dam-dams-by-surface-area-per-state
+#| fig-cap: "State land area, population, and number of dams"
+#| fig-height: 10
+#| fig-width: 14
+#| column: page-right
+
+p1 <- dams_by_state_with_pop |>
+  ggplot() +
+  geom_text(aes(usgs_total_area_less_great_lakes, pop, label = state_abb, color = state_region),
+            check_overlap = FALSE,
+            show.legend = FALSE,
+            key_glyph = "point") +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  labs(
+    subtitle = "A: Population by surface area",
+    x = "State area (sq mi)",
+    y = "Population"
+  )
+
+p2 <- dams_by_state_with_pop |>
+  ggplot() +
+  geom_text(aes(usgs_total_area_less_great_lakes, n, label = state_abb, color = state_region),
+            check_overlap = FALSE,
+            key_glyph = "point") +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(size = 3))) +
+  theme(legend.position.inside = c(0.8, 0.7)) +
+  labs(
+    subtitle = "B: Number of dams by area",
+    x = "State area (sq mi)",
+    y = "Number of dams in the NID"
+  )
+
+p3 <- dams_by_state_with_pop |>
+  ggplot() +
+  geom_text(aes(pop, n, label = state_abb, color = state_region),
+            check_overlap = FALSE,
+            show.legend = FALSE,
+            key_glyph = "point") +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  labs(
+    subtitle = "C: Number of dams by population",
+    x = "Population",
+    y = "Number of dams in the NID"
+  )
+
+p4 <- dams_by_state_with_pop |>
+  left_join(
+    storage_by_state_mi_corrected |>
+      select(state_abb, nidStorage = n),
+    by = "state_abb"
+  ) |>
+  ggplot() +
+  geom_text(aes(n, nidStorage, label = state_abb, color = state_region),
+            check_overlap = FALSE,
+            show.legend = FALSE,
+            key_glyph = "point") +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  labs(
+    subtitle = "D: Dams' volume of water under management",
+    x = "Number of dams in the NID",
+    y = "nidStorage (acre ft)"
+  )
+
+p1 + p2 + p3 + p4 +
+  plot_annotation(
+    title = "State land area, population, and number of dams",
+    subtitle = "Area less Great Lakes (if applicable). Michigan corrected.",
+    caption = my_caption_nid_census
+  )
+
+```
+
+<br>
+
+@fig-dam-ratios below plots the ratio of `surfaceArea` to water under management (`nidStorage`) using *medians* (panels A and C) and *means* (panels B and C). In the plots that employ means, outliers and data errors have more effect. For example, in panel B Washington (WA), Colorado (CO) and Oregon (OR) are higher in the plot, from which I infer that each state has some large, shallow reservoirs (or large data errors).
+
+I found and removed two data errors for New Mexico. Note the reported discrepancy in `damHeight` and `nidStorage` for these two dams with very large `surfaceArea` when they are placed in context with the ten dams in NM with the most surface area (@tbl-nm-bad-data).
+
+```{r}
+#| label: tbl-nm-bad-data
+#| tbl-cap: "Dams in New Mexico with most reported `surfaceArea` of water behind dams"
+#| tbl-cap-location: bottom
+#| output: asis
+#| column: page
+
+dams_no_geo |>
+  filter(state_abb == "NM") |>
+  slice_max(order_by = surfaceArea,
+            n = 10) |>
+  select(name, nidId, surfaceArea, nidHeight, nidStorage) |>
+  gt() |>
+  tab_options(table.font.size = 10) |>
+  tab_header(md(glue("**Dams in New Mexico with largest reported `surfaceArea`**",
+                     "<br>*Acres. Click column headers to sort*"))) |>
+  tab_source_note(md(glue("*Source: NID. Table: Daniel Moul.*"))) |>
+  fmt_number(columns = c(surfaceArea, nidHeight, nidStorage),
+             decimals = 0) |>
+  tab_style(
+    style = list(
+      cell_fill(color = "lightyellow")
+    ),
+    locations = cells_body(
+      rows = str_detect(name, "Encino") | str_detect(name, "Alamos")
+    )
+    ) |>
+  opt_interactive(
+    use_pagination = FALSE
+  )
+  
+```
+
+<br>
+
+The ratio dam surface area::nidStorage is an indicator of the local geography: a high ratio indicates a wide, shallow reservoir behind the dam; a low ratio indicates a deep reservoir in a valley with steep gradients or perhaps a quarry or other excavated area.
+
+Plotting median and mean state ratios by state area per dam (@fig-dam-ratios) reveals some regional clusters.
+
+```{r}
+#| label: fig-dam-ratios
+#| fig-cap: "Median and mean state values for ratio of `surfaceArea` to `nidStorage`"
+#| fig-height: 6
+#| fig-width: 10
+#| column: page-right
+
+p1 <- dams_ratios_per_state |>
+  ggplot(aes(sqmi_per_dam, median_surface_area_to_nidStorage, color = state_region)) +
+  geom_text(aes(label = state_abb),
+            check_overlap = FALSE,
+            show.legend = FALSE,
+            key_glyph = "point") +
+  geom_mark_hull() +
+  scale_x_log10(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  guides(color = "none") +
+  labs(
+    subtitle = "A: Median(dam surface area::nidStorage) by sq mi per dam",
+    x = "State area (sq mi) per dam (log10 scale)",
+    y = "Median ratio"
+  )
+
+p2 <- dams_ratios_per_state |>
+  ggplot(aes(sqmi_per_dam, avg_surface_area_to_nidStorage, color = state_region)) +
+  geom_text(aes(label = state_abb),
+            check_overlap = FALSE,
+            show.legend = FALSE,
+            key_glyph = "point") +
+  geom_mark_hull() +
+  scale_x_log10(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_log10(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.02, 0.04))) +
+  guides(color = "none") +
+  labs(
+    subtitle = "B: Mean(dam surface area::nidStorage) by sq mi per dam",
+    x = "State area (sq mi) per dam (log10 scale)",
+    y = "Mean ratio (log10 scale)"
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "State ratios: median and mean surface area to dam volume",
+    subtitle = "Colored by region",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+## Dam completion and modification
+
+Public dams are major civil works projects that require political will, budgeting, financing, and on-going funding to operate and maintain. Most dams were built after World War II and prior to the Reagan administration in the eighties.
+
+<br>
+
+### New dams
+
+```{r}
+#| label: fig-year-completed
+#| fig-cap: "Year dams were completed and their height"
+#| fig-height: 10
+#| fig-width: 10
+#| column: page-right
+
+dta_for_plot <- dams_no_geo |>
+  select(name, state, nidHeight, nidHeightId, yearCompleted, yearCompletedId, yearsModified)
+
+p1 <- dta_for_plot |>
+  ggplot() +
+  geom_bar(aes(yearCompletedId, fill = nidHeightId)) +
+  # scale_x_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  scale_y_continuous(label = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  guides(fill = "none") +
+  coord_flip() +
+  theme(plot.title.position = "plot") +
+  labs(
+    subtitle = "A: By decade",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- dta_for_plot |>
+  filter(yearCompletedId != "Undetermined") |>
+  ggplot() +
+  geom_vline(xintercept = c(1950, 1979),
+             lty = 2,
+             linewidth = 0.2,
+             alpha = 0.5) +
+  stat_ecdf(aes(yearCompleted)) +
+  scale_x_continuous(breaks = c(1850, 1900, 1950, 1979, 2000)) +
+  scale_y_continuous(label = label_percent(),
+                     expand = expansion(mult = c(0.0, 0.04))) +
+  theme(plot.title.position = "plot") +
+  coord_cartesian(xlim = c(1850, NA)) +
+  labs(
+    subtitle = "B: Cumulative distribution: year completed",
+    x = NULL,
+    y = "Percent of all dams with year built data"
+  )
+
+p3 <- dta_for_plot |>
+  filter(yearCompletedId != "Undetermined") |>
+  ggplot() +
+  geom_vline(xintercept = c(1950, 1979),
+             lty = 2,
+             linewidth = 0.2,
+             alpha = 0.5) +
+  geom_density(aes(yearCompleted, color = nidHeightId)) +
+  scale_x_continuous(breaks = c(1850, 1900, 1950, 1979, 2000)) +
+  guides(color = "none") +
+  theme(plot.title.position = "plot") +
+  coord_cartesian(xlim = c(1850, NA)) +
+  labs(
+    subtitle = "C: Density plot: year completed by height",
+    x = NULL
+  )
+
+p4 <- dta_for_plot |>
+  filter(yearCompletedId != "Undetermined") |>
+  ggplot() +
+  geom_vline(xintercept = c(1950, 1979),
+             lty = 2,
+             linewidth = 0.2,
+             alpha = 0.5) +
+  stat_ecdf(aes(yearCompleted, color = nidHeightId)) +
+  scale_x_continuous(breaks = c(1850, 1900, 1950, 1979, 2000)) +
+  scale_y_continuous(label = label_percent(),
+                     expand = expansion(mult = c(0.0, 0.04))) +
+  guides(color = guide_legend(position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  theme(plot.title.position = "plot",
+        legend.position.inside = c(0.3, 0.7)) +
+  coord_cartesian(xlim = c(1850, NA)) +
+  labs(
+    subtitle = "D: Cumulative distribution: year completed by dam height",
+    x = NULL,
+    y = "Percent of all dams with year built data"
+  )
+
+p1 + p2 + p3 + p4 +
+  plot_annotation(
+    title = "The heyday of dam building in the US was 1950-1979",
+    subtitle = "It's likely that the dams of undetermined nidHeight built since 1950 are small dams (plots C and D).",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+### Primary purposes
+
+```{r}
+#| label: fig-year-completed-primary-purpose
+#| fig-cap: "New dams and their primary purpose, by region"
+#| fig-height: 8
+#| fig-width: 12
+#| column: page-right
+
+yearCompletedId_levels <- c("Before 1900", "1900-1909", "1910-1919", "1920-1929", "1930-1939",
+                            "1940-1949", "1950-1959", "1960-1969", "1970-1979", "1980-1989",
+                            "1990-1999", "Since 2000", "Undetermined")
+
+yearCompletedId_breaks <- c("Before 1900", # "1900-1909", 
+                            "1910-1919", # "1920-1929", 
+                            "1930-1939", # "1940-1949", 
+                            "1950-1959", # "1960-1969", 
+                            "1970-1979", # "1980-1989",
+                            "1990-1999" # , "Since 2000", "Undetermined"
+                            )
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, n = 5)) |>
+  count(yearCompletedId, primaryPurposeId, state_region)
+
+year_build_by_primary_purpose_big_dams <- dams_no_geo |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId, big_dam) |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  filter(big_dam) |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, n = 5)) |>
+  count(yearCompletedId, primaryPurposeId, state_region)
+
+
+p1 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, color = primaryPurposeId, group = primaryPurposeId)) +
+  # geom_point(aes(yearCompletedId, n, color = primaryPurposeId),
+  #             size = 0.75,
+  #            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(label = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  guides(color = guide_legend(#position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~state_region) +
+  theme(plot.title.position = "plot",
+        # legend.position.inside = c(I(0.15), I(0.85)),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    subtitle = "A: Dams",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- year_build_by_primary_purpose_big_dams |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, color = primaryPurposeId, group = primaryPurposeId)) +
+  # geom_point(aes(yearCompletedId, n, color = primaryPurposeId),
+  #             size = 0.75,
+  #            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(label = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  scale_color_viridis_d(end = 0.9) +
+  guides(color = guide_legend(#position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~state_region) +
+  theme(plot.title.position = "plot",
+        # legend.position.inside = c(I(0.15), I(0.85)),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    subtitle = "B: Big dams",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "Most dams were built in the South. Most big dams were built in the West",
+    subtitle = glue("New dams and their primary purpose, by region",
+                    "\nIncludes dams for which purpose and year completed data are available"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-year-completed-primary-purpose-south-region
+#| fig-cap: "New dams and their purpose (South region)"
+#| fig-height: 8
+#| fig-width: 12
+#| column: page-right
+#| warning: false
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  filter(state_region == "South") |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, n = 5)) |>
+  count(yearCompletedId, primaryPurposeId, state_region, state_abb)
+
+year_build_by_primary_purpose_big_dams <- dams_no_geo |>
+  filter(big_dam) |>
+  filter(state_region == "South") |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, n = 5)) |>
+  count(yearCompletedId, primaryPurposeId, state_region, state_abb)
+
+
+p1 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, color = primaryPurposeId, group = primaryPurposeId)) +
+  # geom_point(aes(yearCompletedId, n, color = primaryPurposeId),
+  #            size = 0.75,
+  #            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(#label = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  guides(color = guide_legend(# position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~state_abb)  +
+  theme(plot.title.position = "plot",
+        # legend.position.inside = c(I(0.15), I(0.85)),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    subtitle = "A: Dams",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- year_build_by_primary_purpose_big_dams |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, color = primaryPurposeId, group = primaryPurposeId)) +
+  # geom_point(aes(yearCompletedId, n, color = primaryPurposeId),
+  #             size = 0.75,
+  #            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(breaks = 2 * 0:5,
+                     #label = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  scale_color_viridis_d(end = 0.9) +
+  guides(color = guide_legend(# position = "inside",
+                              override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~state_abb)  +
+  theme(plot.title.position = "plot",
+        # legend.position.inside = c(I(0.15), I(0.85)),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    subtitle = "B: Big dams",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = glue("Most of the dams in the South were built in Texas and Oklahoma", 
+                 "\nfor flood risk reduction"),
+    subtitle = glue("New dams in the South, by primary purpose",
+                    "\nIncludes dams for which purpose and year completed data are available"),
+    
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-year-completed-primary-purpose-states-by-decade-and-cumulative
+#| fig-cap: "New dams in each state, by primary purpose"
+#| fig-height: 10
+#| fig-width: 8
+#| column: page-right
+#| warning: false
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, n = 5)) |>
+  count(yearCompletedId, primaryPurposeId, state_region, state_abb) |>
+  mutate(primaryPurposeId = fct_reorder(primaryPurposeId, -n, min))
+
+dta_highlight <- year_build_by_primary_purpose |>
+  slice_max(order_by = n, n = 1,
+            by = c(primaryPurposeId))
+
+p1 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, group = state_abb),
+            linewidth = 0.2,
+            alpha = 0.2) + 
+  geom_point(data = dta_highlight,
+             aes(yearCompletedId, n, ),
+             size = 2,
+             color = "steelblue",
+             show.legend = FALSE) +
+  geom_text(data = dta_highlight,
+            aes(yearCompletedId, n, label = state_abb),
+            nudge_x = 1,
+            color = "steelblue",
+            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.1))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~primaryPurposeId, scales = "free_y")  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)
+        ) +
+  labs(
+    subtitle = "A: By decade",
+    x = NULL,
+    y = NULL
+  )
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, n = 5)) |>
+  count(yearCompletedId, primaryPurposeId, state_abb) |>
+  complete(yearCompletedId, primaryPurposeId, state_abb,
+           fill = list(n = 0)) |>
+  mutate(n_cum = cumsum(n),
+         idx = row_number(),
+         .by = c(primaryPurposeId, state_abb)) |>
+  mutate(primaryPurposeId = fct_reorder(primaryPurposeId, -n_cum, min))
+
+dta_highlight <- year_build_by_primary_purpose |>
+  filter(yearCompletedId != "Undetermined", 
+         yearCompletedId == "Since 2000") |>
+  slice_max(order_by = n_cum, n = 1,
+            by = primaryPurposeId)
+
+p2 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n_cum, group = state_abb),
+            linewidth = 0.2,
+            alpha = 0.2) + 
+  geom_text(data = dta_highlight,
+            aes(yearCompletedId, n_cum, label = state_abb),
+            nudge_x = 0.5,
+            color = "steelblue",
+            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.1))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~primaryPurposeId, scales = "free_y")  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)
+        ) +
+  labs(
+    subtitle = "B: Cumulative",
+    x = NULL,
+    y = NULL
+  )
+
+p1 / p2 +
+  plot_annotation(
+    title = "The most common purposes vary by state\ndue to geography and local priorities",
+    subtitle = glue("New dams in each state, by primary purpose",
+                    "\nIncludes dams for which purpose and year completed data are available"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+Unpacking the "other" category in @fig-year-completed-primary-purpose-states-by-decade-and-cumulative above, 
+@fig-year-completed-primary-purpose-states-one-plot-cumulative-other-category offers some surprises. 
+
+* I did not expect New York to have the most hydroelectric dams. Or the most dams for navigation, which appears to be mostly related to the Erie canal "from 1905 to 1918 when the "Barge Canal" was built and over half the original route was abandoned."^[<https://en.wikipedia.org/wiki/Erie_Canal> ]
+* Missouri has the most dams for debris control and grade stabilization, presumably due to mining.
+* Florida has the most dams for tailings. I expected another state with a lot of mining to lead here.
+
+```{r}
+#| label: fig-year-completed-primary-purpose-states-one-plot-cumulative-other-category
+#| fig-cap: "Unpacking the 'other' category"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+#| warning: false
+
+exclude_purposes <- c("Recreation", "Flood Risk Reduction", "Fire Protection, Stock,\nOr Small Fish Pond",
+                      "Irrigation", "Water Supply")
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  filter(!primaryPurposeId %in% exclude_purposes) |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  count(yearCompletedId, primaryPurposeId, state_abb) |>
+  complete(yearCompletedId, primaryPurposeId, state_abb,
+           fill = list(n = 0)) |>
+  mutate(n_cum = cumsum(n),
+         idx = row_number(),
+         .by = c(primaryPurposeId, state_abb)) |>
+  mutate(primaryPurposeId = fct_reorder(primaryPurposeId, -n_cum, min))
+
+dta_highlight <- year_build_by_primary_purpose |>
+  filter(yearCompletedId != "Undetermined", 
+         yearCompletedId == "Since 2000") |>
+  slice_max(order_by = n_cum, n = 1,
+            by = primaryPurposeId)
+
+p1 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n_cum, group = state_abb),
+            linewidth = 0.2,
+            alpha = 0.2) + 
+  geom_text(data = dta_highlight,
+            aes(yearCompletedId, n_cum, label = state_abb),
+            nudge_x = 0.5,
+            color = "steelblue",
+            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.1))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~primaryPurposeId, scales = "free_y")  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)
+        ) +
+  labs(
+    subtitle = "A: Dams",
+    x = NULL,
+    y = NULL
+  )
+ 
+p1 +
+  plot_annotation(
+    title = "New York and Missouri are top states\nfor two of the 'other' categories",
+    subtitle = glue("'Other' cumulative new dams in each state, by primary purpose",
+                    "\nIncludes dams for which purpose and year completed data are available"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-year-completed-primary-purpose-states
+#| fig-cap: "New dams and their primary purpose, by state"
+#| fig-height: 12
+#| fig-width: 12
+#| column: page-right
+#| warning: false
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, n = 5)) |>
+  count(yearCompletedId, primaryPurposeId, state_region, state_abb)
+
+p1 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, color = primaryPurposeId, group = primaryPurposeId)) +
+  # geom_point(aes(yearCompletedId, n, color = primaryPurposeId),
+  #            size = 0.75,
+  #            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(label = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3),
+                              nrow = 1)) +
+  expand_limits(y = 0) +
+  facet_wrap(~state_abb, scales = "free_y")  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)
+        ) +
+  labs(
+    x = NULL,
+    y = NULL
+  )
+
+p1 +
+  plot_annotation(
+    title = "New dams and their primary purpose, by state",
+    subtitle = glue("Includes dams for which purpose and year completed data are available", 
+                    "\nY axis scale varies"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-year-completed-primary-purpose-states-big
+#| fig-cap: "New big dams and their primary purpose, by state"
+#| fig-height: 12
+#| fig-width: 12
+#| column: page-right
+#| warning: false
+
+year_build_by_primary_purpose_big_dams <- dams_no_geo |>
+  filter(big_dam) |>
+  # filter(state_region == "South") |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId,
+                                  levels = yearCompletedId_levels,
+                                  ordered = TRUE)) |>
+  mutate(primaryPurposeId = fct_lump_n(primaryPurposeId, n = 5)) |>
+  count(yearCompletedId, primaryPurposeId, state_region, state_abb)
+
+p2 <- year_build_by_primary_purpose_big_dams |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, color = primaryPurposeId, group = primaryPurposeId)) +
+  geom_point(aes(yearCompletedId, n, color = primaryPurposeId),
+              size = 0.75,
+             show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(#breaks = 2 * 0:5,
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  scale_color_viridis_d(end = 0.90) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3),
+                              nrow = 1)) +
+  expand_limits(y = 0) +
+  facet_wrap(~state_abb)  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    x = NULL,
+    y = NULL
+  )
+
+p2 +
+  plot_annotation(
+    title = "California has the most big dams",
+    subtitle = glue("New big dams and their primary purpose, by state",
+                    "Includes dams for which purpose and year completed data are available"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+### All purposes
+
+Since dams are often built for multiple purposes, and it can be a judgement call to decide which purpose is "primary", this section considers all documented purposes.
+
+```{r}
+#| label: fig-purposes-compared
+#| fig-cap: "Primary and all purposes compared"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+#| warning: false
+
+
+purposes_primary <- dams_no_geo |>
+  count(primaryPurposeId)
+
+purposes_secondary <- dams_no_geo_all_purposes |>
+  count(purpose_id)
+
+purposes_compared <- 
+  left_join(
+    purposes_primary |>
+      rename(purpose_id = primaryPurposeId),
+    purposes_secondary,
+    by = "purpose_id",
+    suffix = c("_primary", "_all")
+  ) |>
+  filter(purpose_id != "Other or not specified") |>
+  mutate(pct_primary_of_all = n_primary / n_all)
+
+p1 <- purposes_compared |>
+  mutate(purpose_id = fct_reorder(purpose_id, pct_primary_of_all)) |>
+  ggplot() +
+  geom_col(aes(n_all, purpose_id),
+           alpha = 0.3) +
+  geom_col(aes(n_primary, purpose_id),
+           alpha = 0.3) +
+  geom_text(aes(-10, purpose_id, label = percent(pct_primary_of_all, accuracy = 1)),
+            nudge_x = -500,
+            hjust = 1) +
+  scale_x_continuous(label = label_number(scale_cut = cut_short_scale())) +
+  expand_limits(x = -4000) +
+  labs(
+    subtitle = "A: Count of purposes and\nproportion of primary purposes",
+    x = "Count",
+    y = NULL
+  )
+
+tailings_pct <- purposes_compared |>
+  filter(purpose_id == "Tailings") |>
+  pull(pct_primary_of_all)
+
+p2 <- dams_no_geo |>
+  mutate(n_purposes = str_count(purposeIds, ";") + 1) |>
+  ggplot() +
+  geom_histogram(aes(n_purposes),
+                 binwidth = 1) +
+  scale_y_continuous(label = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    subtitle = "B: Number of purposes per dam",
+    x = NULL,
+    y = "Count"
+  )
+
+p2 <- dams_no_geo |>
+  mutate(n_purposes = str_count(purposeIds, ";") + 1) |>
+  filter(!is.na(n_purposes)) |>
+  arrange(desc(n_purposes)) |>
+  count(n_purposes) |>
+  arrange(desc(n)) |>
+  mutate(pct_n = n / sum(n),
+         n_cum = cumsum(n),
+         n_purpose_label = glue("{n_purposes} purposes"),
+         n_purpose_label = fct_rev(n_purpose_label),
+         tmp = 0) |>
+  ggplot() +
+  geom_line(aes(n_cum, n_purpose_label, group = tmp),
+            linewidth = 0.5,
+            color = "steelblue") +
+  geom_point(aes(n_cum, n_purpose_label, group = tmp),
+            size = 2,
+            color = "steelblue") +
+  geom_text(aes(x = 15000, y = n_purpose_label, label = n),
+            hjust = 1) +
+  geom_text(aes(x = 30000, y = n_purpose_label, label = percent(pct_n, accuracy = 0.1)),
+            hjust = 1) +
+  scale_x_continuous(label = label_number(scale_cut = cut_short_scale())) +
+  expand_limits(x = 0) +
+  labs(
+    subtitle = "B: Number of purposes per dam",
+    x = "Cumulative number of dams",
+    y = NULL
+  )
+
+
+p1 + p2 +
+  plot_annotation(
+    title = "Purposes: primary purpose\nas percent of all purpose mentions",
+    subtitle = glue("Ordered by percent of purposes in which this purpose is primary. For example,",
+                    " {percent(tailings_pct, accuracy = 1)} of the cases",
+                    "\nin which 'Tailings' is mentioned, it's the primary purpose.", 
+                    " Or stated another way,",
+                    " in {percent(1 - tailings_pct, accuracy = 1)} of the cases,",
+                    "\n'Tailings' is a secondary purpose"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-year-completed-purpose-states-by-decade-and-cumulative
+#| fig-cap: "New dams in each state, by purpose"
+#| fig-height: 10
+#| fig-width: 8
+#| column: page-right
+#| warning: false
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  left_join(dams_no_geo_all_purposes |>
+              select(nidId, purpose_id),
+            by = join_by(nidId)) |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, purpose_id, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(purpose_id = fct_lump_n(purpose_id, n = 5)) |>
+  count(yearCompletedId, purpose_id, state_region, state_abb) |>
+  mutate(purpose_id = fct_reorder(purpose_id, -n, min))
+
+dta_highlight <- year_build_by_primary_purpose |>
+  slice_max(order_by = n, n = 1,
+            by = c(purpose_id))
+
+p1 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, group = state_abb),
+            linewidth = 0.2,
+            alpha = 0.2) + 
+  geom_point(data = dta_highlight,
+             aes(yearCompletedId, n, ),
+             size = 2,
+             color = "steelblue",
+             show.legend = FALSE) +
+  geom_text(data = dta_highlight,
+            aes(yearCompletedId, n, label = state_abb),
+            nudge_x = 1,
+            color = "steelblue",
+            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.1))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~purpose_id, scales = "free_y")  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)
+        ) +
+  labs(
+    subtitle = "A: By decade",
+    x = NULL,
+    y = NULL
+  )
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  left_join(dams_no_geo_all_purposes |>
+              select(nidId, purpose_id),
+            by = join_by(nidId)) |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, purpose_id, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(purpose_id = fct_lump_n(purpose_id, n = 5)) |>
+  count(yearCompletedId, purpose_id, state_abb) |>
+  complete(yearCompletedId, purpose_id, state_abb,
+           fill = list(n = 0)) |>
+  mutate(n_cum = cumsum(n),
+         idx = row_number(),
+         .by = c(purpose_id, state_abb)) |>
+  mutate(purpose_id = fct_reorder(purpose_id, -n_cum, min))
+
+dta_highlight <- year_build_by_primary_purpose |>
+  filter(yearCompletedId != "Undetermined", 
+         yearCompletedId == "Since 2000") |>
+  slice_max(order_by = n_cum, n = 1,
+            by = purpose_id)
+
+p2 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n_cum, group = state_abb),
+            linewidth = 0.2,
+            alpha = 0.2) + 
+  geom_text(data = dta_highlight,
+            aes(yearCompletedId, n_cum, label = state_abb),
+            nudge_x = 0.5,
+            color = "steelblue",
+            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.1))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~purpose_id, scales = "free_y")  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)
+        ) +
+  labs(
+    subtitle = "B: Cumulative",
+    x = NULL,
+    y = NULL
+  )
+
+p1 / p2 +
+  plot_annotation(
+    title = "The most common purposes vary by state\ndue to geography and local priorities",
+    subtitle = glue("New dams in each state, by purpose",
+                    "\nIncludes dams for which purpose and year completed data are available"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+Unpacking the "other" category when considering all purposes in @fig-year-completed-purpose-states-by-decade-and-cumulative above, the surprises in seen in @fig-year-completed-primary-purpose-states-one-plot-cumulative-other-category have gone away in @fig-year-completed-purpose-states-one-plot-cumulative-other-category:
+
+* California overtook New York in number of hydroelectric dams
+* Texas overtook Missouri in dams for debris control (but not for grade stabilization)
+
+Florida continues to have many more dams for tailings than other states, which remains a surprise..
+
+```{r}
+#| label: fig-year-completed-purpose-states-one-plot-cumulative-other-category
+#| fig-cap: "Unpacking the 'other' category in purposes"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+#| warning: false
+
+exclude_purposes <- c("Recreation", "Flood Risk Reduction", "Fire Protection, Stock,\nOr Small Fish Pond",
+                      "Irrigation", "Water Supply")
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  left_join(dams_no_geo_all_purposes |>
+              select(nidId, purpose_id),
+            by = join_by(nidId)) |>
+  filter(yearCompletedId != "Undetermined",
+         purpose_id != "Other or not specified",
+         purpose_id != "Other") |>
+  filter(!purpose_id %in% exclude_purposes) |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, purpose_id, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  count(yearCompletedId, purpose_id, state_abb) |>
+  complete(yearCompletedId, purpose_id, state_abb,
+           fill = list(n = 0)) |>
+  mutate(n_cum = cumsum(n),
+         idx = row_number(),
+         .by = c(purpose_id, state_abb)) |>
+  mutate(purpose_id = fct_reorder(purpose_id, -n_cum, min))
+
+dta_highlight <- year_build_by_primary_purpose |>
+  filter(yearCompletedId != "Undetermined", 
+         yearCompletedId == "Since 2000") |>
+  slice_max(order_by = n_cum, n = 1,
+            by = purpose_id)
+
+p1 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n_cum, group = state_abb),
+            linewidth = 0.2,
+            alpha = 0.2) + 
+  geom_text(data = dta_highlight,
+            aes(yearCompletedId, n_cum, label = state_abb),
+            nudge_x = 0.5,
+            color = "steelblue",
+            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.1))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3))) +
+  expand_limits(y = 0) +
+  facet_wrap(~purpose_id, scales = "free_y")  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)
+        ) +
+  labs(
+    # subtitle = "A: Dams",
+    x = NULL,
+    y = NULL
+  )
+ 
+p1 +
+  plot_annotation(
+    title = "New York and Missouri are top states\nfor two of the 'other' categories",
+    subtitle = glue("'Other' cumulative new dams in each state, by purpose",
+                    "\nIncludes dams for which purpose and year completed data are available"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-year-completed-purpose-states
+#| fig-cap: "New dams and their purposes, by state"
+#| fig-height: 12
+#| fig-width: 12
+#| column: page-right
+#| warning: false
+
+year_build_by_primary_purpose <- dams_no_geo |>
+  left_join(dams_no_geo_all_purposes |>
+              select(nidId, purpose_id),
+            by = join_by(nidId)) |>
+  filter(yearCompletedId != "Undetermined",
+         primaryPurposeId != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, purpose_id, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId, 
+                                  levels = yearCompletedId_levels, 
+                                  ordered = TRUE)) |>
+  mutate(purpose_id = fct_lump_n(purpose_id, n = 5)) |>
+  count(yearCompletedId, purpose_id, state_region, state_abb)
+
+p1 <- year_build_by_primary_purpose |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, color = purpose_id, group = purpose_id)) +
+  # geom_point(aes(yearCompletedId, n, color = primaryPurposeId),
+  #            size = 0.75,
+  #            show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(#label = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3),
+                              nrow = 1)) +
+  expand_limits(y = 0) +
+  facet_wrap(~state_abb, scales = "free_y")  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)
+        ) +
+  labs(
+    x = NULL,
+    y = NULL
+  )
+
+p1 +
+  plot_annotation(
+    title = "New dams and their purposes, by state",
+    subtitle = glue("Includes dams for which purpose and year completed data are available", 
+                    "\nY axis scale varies"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+Many big dams serve multiple purposes. Compare California and Colorado below with @fig-year-completed-primary-purpose-states-big, which counts only primary purposes.
+
+```{r}
+#| label: fig-year-completed-purpose-states-big
+#| fig-cap: "New big dams and their purposes, by state"
+#| fig-height: 12
+#| fig-width: 12
+#| column: page-right
+#| warning: false
+
+year_build_by_primary_purpose_big_dams <- dams_no_geo |>
+  filter(big_dam) |>
+  left_join(dams_no_geo_all_purposes |>
+              select(nidId, purpose_id),
+            by = join_by(nidId)) |>
+  filter(yearCompletedId != "Undetermined",
+         purpose_id != "Other or not specified") |>
+  select(nidId, primaryOwnerTypeId, primaryPurposeId, purpose_id, state, state_abb, state_region, nidStorage, yearCompleted, yearCompletedId) |>
+  mutate(yearCompletedId = factor(yearCompletedId,
+                                  levels = yearCompletedId_levels,
+                                  ordered = TRUE)) |>
+  mutate(purpose_id = fct_lump_n(purpose_id, n = 5)) |>
+  count(yearCompletedId, purpose_id, state_region, state_abb)
+
+p2 <- year_build_by_primary_purpose_big_dams |>
+  ggplot() +
+  geom_line(aes(yearCompletedId, n, color = purpose_id, group = purpose_id)) +
+  geom_point(aes(yearCompletedId, n, color = purpose_id),
+              size = 0.75,
+             show.legend = FALSE) +
+  scale_x_discrete(breaks = yearCompletedId_breaks) +
+  scale_y_continuous(#breaks = 2 * 0:5,
+                     expand = expansion(mult = c(0.01, 0.04))) +
+  scale_color_viridis_d(end = 0.90) +
+  guides(color = guide_legend(override.aes = list(linewidth = 3),
+                              nrow = 1)) +
+  expand_limits(y = 0) +
+  facet_wrap(~state_abb)  +
+  theme(plot.title.position = "plot",
+        legend.position = "top",
+        axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    x = NULL,
+    y = NULL
+  )
+
+p2 +
+  plot_annotation(
+    title = "California has the most big dams",
+    subtitle = glue("New big dams and their purposes, by state",
+                    "\nIncludes dams for which purpose and year completed data are available"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+## Dam modifications
+
+The data set includes records of modifications for a small portion of the dams:
+
+> Year (four digits) when major modifications or rehabilitation of dam or major control structures were
+completed. Major modifications are defined as a structural, foundation, or mechanical construction activity
+which significantly restores the project to original condition; changes the project’s operation; capacity or
+structural characteristics (e.g. spillway or seismic modification); or increases the longevity, stability, or safety
+of the dam and appurtenant structures.
+> 
+> Category describing the type of modification: Foundation, Hydraulic, Mechanical, Seismic, Structural, Other^[National Inventory of Dams Data Dictionary <https://usace-cwbi-prod-il2-nld2-docs.s3-us-gov-west-1.amazonaws.com/ec51e2ba-daff-4dbe-95eb-af13b91066ba/NID%20Data%20Dictionary%202021-12-14.pdf> ]
+
+```{r}
+#| label: fig-modification-years
+#| fig-cap: "Distibution of years from completion to modifications"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+dta_for_plot_tmp1 <- dams_no_geo |>
+  filter(nidHeight > 0,
+         !is.na(yearsModified),
+         yearsModified != "-1")
+
+n_dams_with_mod_data <- nrow(dta_for_plot_tmp1)
+pct_dams_with_mod_data = n_dams_with_mod_data / nrow(dams_no_geo)
+
+dta_for_plot <- dta_for_plot_tmp1 |>
+  select(name, state, nidId, nidHeight, nidHeightId, yearCompleted, yearCompletedId, yearsModified, big_dam) |>
+  mutate(yearsModified_orig = yearsModified) |>
+  separate_longer_delim(yearsModified, delim = ";") |>
+  mutate(modified_reason = str_extract(yearsModified, "[A-Z]$"),
+         year_modified = parse_number(yearsModified)) |>
+  mutate(years_to_mod = year_modified - yearCompleted,
+         .by = c(name, nidId)) |>
+  mutate(years_since_last_mod = years_to_mod - lag(years_to_mod, default = NA),
+         .by = c(name, nidId)) |>
+  mutate(years_since_last_mod = ifelse(is.na(years_since_last_mod),
+                                       years_to_mod,
+                                       years_since_last_mod)) |>
+  filter(years_to_mod > 0) |>
+  mutate(mod_idx = row_number(),
+         .by = c(name, nidId)) |>
+  mutate(mod_idx_label = fct_reorder(glue("mod {mod_idx}"), mod_idx)) |>
+  distinct(name, nidId, year_modified, .keep_all = TRUE) |> # remove duplicate rows where mods were made for multiple reasons
+  mutate(mod_idx_label = fct_lump_n(mod_idx_label, 
+                                    n = 5,
+                                    other_level = "mod 6+"))
+
+n_dams_with_good_mod_data <- dta_for_plot |>
+  distinct(name, nidId) |>
+  nrow()
+
+pct_dams_with_good_mod_data = n_dams_with_good_mod_data / nrow(dams_no_geo)
+
+n_mod_one_only <- dta_for_plot |>
+  filter(mod_idx_label == "mod 1") |>
+  nrow()
+
+n_mod_after_one <- dta_for_plot |>
+  filter(mod_idx_label != "mod 1") |>
+  nrow()
+
+pct_mod_data_is_mod1 <- n_mod_one_only / (n_mod_one_only + n_mod_after_one)
+
+my_binwidth <- 10
+
+p1 <- dta_for_plot |>
+  ggplot() +
+  geom_histogram(aes(years_to_mod),
+                 binwidth = my_binwidth) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  labs(
+    subtitle = "A: Years from dam completion\nto modification (all mods)",
+  )
+
+p2 <- dta_for_plot |>
+  filter(mod_idx == 1) |>
+  ggplot() +
+  geom_histogram(aes(years_to_mod),
+                 binwidth = my_binwidth) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  labs(
+    subtitle = "B: Years from dam completion\nto first modification",
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "Distributions of years from completion to modifications",
+    subtitle = glue("Includes {n_dams_with_good_mod_data} ({percent(pct_dams_with_good_mod_data, accuracy = 1)})",
+                    " dams with modification data",
+                    ". Binwidth: {my_binwidth} years"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+In @fig-modification-years above we see the distribution of years from completion to any mod (@fig-modification-years panel A) and to the first model (panel B). The distributions have a similar shape--partly because `r percent(pct_mod_data_is_mod1)` of dams with modification data are for the first modification.
+
+Even so, when we look at the distribution of years from completion to modification (@fig-years-from-completion-to-modification-distribution), the shapes are similar.
+
+```{r}
+#| label: fig-years-from-completion-to-modification-distribution
+#| fig-cap: "Years from completion to last modification"
+#| fig-height: 6
+#| fig-width: 10
+#| column: page-right
+
+my_binwidth <- 10
+
+p1 <- dta_for_plot |>
+  ggplot() +
+  geom_histogram(aes(years_to_mod),
+                 binwidth = my_binwidth) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  facet_wrap(~mod_idx_label, scales = "free_y") +
+  labs(
+    title = "Density plot",
+  )
+
+p2 <- dta_for_plot |>
+  ggplot() +
+  geom_density(aes(years_to_mod, color = mod_idx_label)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  guides(color = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.8, 0.7)) +
+  coord_cartesian(x = c(0, 200)) +
+  labs(
+    title = "Density plot",
+    color = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "Similar distributions of years from completion to modification\n(all modifications)",
+    subtitle = glue("Includes {n_dams_with_good_mod_data} ({percent(pct_dams_with_good_mod_data, accuracy = 1)})", 
+                    " dams with modification data"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+When we look at the years since the last modification (@fig-years-since-last-mod-distribution), the distributions are a similar shape for mods 2+.
+
+```{r}
+#| label: fig-years-since-last-mod-distribution
+#| fig-cap: "Distribution of years since last modificaiton"
+#| fig-height: 6
+#| fig-width: 10
+#| column: page-right
+
+my_binwidth <- 10
+
+p1 <- dta_for_plot |>
+  ggplot() +
+  geom_histogram(aes(years_since_last_mod),
+                 binwidth = my_binwidth,
+                 na.rm = TRUE) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  facet_wrap(~mod_idx_label, scales = "free_y") +
+  labs(
+    subtitle = glue("Histogram; binwidth: {my_binwidth} years")
+  )
+
+p2 <- dta_for_plot |>
+  ggplot() +
+  geom_density(aes(years_since_last_mod, color = mod_idx_label),
+               na.rm = TRUE) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  scale_color_viridis_d(end = 0.9) +
+  guides(color = guide_legend(position = "inside")) +
+  theme(legend.position.inside = c(0.8, 0.7)) +
+  coord_cartesian(x = c(0, 150)) +
+  labs(
+    subtitle = "Density plot",
+    color = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = glue("For mods 2+ there is a similar distributions of years\n since last modification"),
+    subtitle = glue("Includes {n_dams_with_good_mod_data} ({percent(pct_dams_with_good_mod_data, accuracy = 1)}) dams with modification data"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+### Reasons for modification
+
+Big dams are more frequently modified for structural or seismic reasons (@fig-reasons-for-modification).
+
+```{r}
+#| label: fig-reasons-for-modification
+#| fig-cap: "Reasons for dam modification"
+#| fig-height: 6
+#| fig-width: 8
+#| column: page-right
+
+dta_for_plot_reasons <- dta_for_plot |>
+  filter(!is.na(modified_reason)) |>
+  mutate(mod_reason_label = case_match(
+    modified_reason,
+    "F" ~ "Foundation",
+    "H" ~ "Hydraulic",
+    "M" ~ "Mechanical",
+    "E" ~ "Seismic",
+    "S" ~ "Structural",
+    "O" ~ "Other",
+  )) |>
+  count(mod_reason_label, sort = TRUE) |>
+  mutate(mod_reason_label = fct_reorder(mod_reason_label, n),
+         n_pct = `n` / sum(`n`))
+
+p1 <- dta_for_plot_reasons |>
+  ggplot(aes(n, mod_reason_label)) +
+  geom_col() +
+  geom_text(aes(x = 0.9 * max(n), label = glue("{n} | {percent(n_pct, accuracy = 1)}")),
+            hjust = 1,
+            size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  # scale_y_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  labs(
+    subtitle = "A: All dams",
+    x = NULL,
+    y = NULL
+  )
+
+dta_for_plot_reasons_big <- dta_for_plot |>
+  filter(!is.na(modified_reason),
+         big_dam) |>
+  mutate(mod_reason_label = case_match(
+    modified_reason,
+    "F" ~ "Foundation",
+    "H" ~ "Hydraulic",
+    "M" ~ "Mechanical",
+    "E" ~ "Seismic",
+    "S" ~ "Structural",
+    "O" ~ "Other",
+  )) |>
+  count(mod_reason_label, sort = TRUE) |>
+  mutate(mod_reason_label = fct_reorder(mod_reason_label, n),
+         n_pct = `n` / sum(`n`))
+
+p2 <- dta_for_plot_reasons_big |>
+  ggplot(aes(n, mod_reason_label)) +
+  geom_col() +
+  geom_text(aes(x = 0.9 * max(n), label = glue("{n} | {percent(n_pct, accuracy = 1)}")),
+            hjust = 1,
+            size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  # scale_y_continuous(expand = expansion(mult = c(0.01, 0.04))) +
+  labs(
+    subtitle = "B: Big dams",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "Reasons for dam modifications",
+    caption = my_caption
+  )
+
+```
+
+
+Is the modification data complete? Unlikely, especially in earlier years and for smaller dams. Beyond that intuition, I cannot assess what proportion of modifications might be missing. Of the `r comma(nrow(dams_no_geo))` dams, `r comma(n_dams_with_mod_data)` have associated modification dates. `r comma(n_dams_with_good_mod_data)` have valid modification dates.
+
+<br>
+
+## State-level information {#sec-state-level-data}
+
+Below is state-level information, in case you wish to dig in.
+
+```{r}
+#| label: fig-count-state-basic-counts
+#| fig-cap: "Basic counts: owner, purpose, dam type - by state"
+#| fig-height: 10
+#| fig-width: 12
+#| column: page-right
+
+p1 <- dams_no_geo |>
+  count(state, primaryOwnerTypeId) |>
+  mutate(state = fct_reorder(state, n, sum),
+         primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, n, sum)) |>
+  ggplot() +
+  geom_col(aes(x = n, y = state, fill = primaryOwnerTypeId),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  guides(fill = guide_legend(reverse = TRUE,
+                             ncol = 2)) +
+  theme(legend.position = "top")+
+  labs(
+    subtitle = "A: Primary owner",
+    x = NULL,
+    y = NULL,
+    fill = NULL
+  )
+
+p2 <- dams_no_geo |>
+  count(state, primaryPurposeId) |>
+  mutate(state = fct_reorder(state, n, sum),
+         primaryPurposeId = fct_reorder(primaryPurposeId, n, sum)) |>
+  ggplot() +
+  geom_col(aes(x = n, y = state, fill = primaryPurposeId),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  guides(fill = guide_legend(reverse = TRUE,
+                             ncol = 2)) +
+  theme(legend.position = "top")+
+  labs(
+    subtitle = "B: Primary purpose",
+    x = NULL,
+    y = NULL,
+    fill = NULL
+  )
+
+p3 <- dams_no_geo |>
+  count(state, primaryDamTypeId) |>
+  mutate(state = fct_reorder(state, n, sum),
+         primaryDamTypeId = fct_reorder(primaryDamTypeId, n, sum)) |>
+  ggplot() +
+  geom_col(aes(x = n, y = state, fill = primaryDamTypeId),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  guides(fill = guide_legend(reverse = TRUE,
+                             ncol = 2)) +
+  theme(legend.position = "top") +
+  labs(
+    subtitle = "C: Primary dam type",
+    x = NULL,
+    y = NULL,
+    fill = NULL
+  )
+
+p1 + p2 + p3 +
+  plot_annotation(
+    title = "Basic counts: owner, purpose, dam type",
+    caption = my_caption
+  )
+
+
+```
+
+<br>
+
+```{r}
+#| label: fig-count-state-basic-counts-100pct-bars
+#| fig-cap: "Basic counts: owner, purpose, dam type (proportion of each category) - by state"
+#| fig-height: 10
+#| fig-width: 12
+#| column: page-right
+
+p1 <- dams_no_geo |>
+  count(state, primaryOwnerTypeId) |>
+  mutate(state = fct_reorder(state, n, sum),
+         primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, n, sum)) |>
+  ggplot() +
+  geom_col(aes(x = n, y = state, fill = primaryOwnerTypeId),
+           position = "fill",
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  guides(fill = guide_legend(reverse = TRUE,
+                             ncol = 2)) +
+  theme(legend.position = "top")+
+  labs(
+    subtitle = "A: Primary owner",
+    x = NULL,
+    y = NULL,
+    fill = NULL
+  )
+
+p2 <- dams_no_geo |>
+  count(state, primaryPurposeId) |>
+  mutate(state = fct_reorder(state, n, sum),
+         primaryPurposeId = fct_reorder(primaryPurposeId, n, sum)) |>
+  ggplot() +
+  geom_col(aes(x = n, y = state, fill = primaryPurposeId),
+           position = "fill",
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  guides(fill = guide_legend(reverse = TRUE,
+                             ncol = 2)) +
+  theme(legend.position = "top")+
+  labs(
+    subtitle = "B: Primary purpose",
+    x = NULL,
+    y = NULL,
+    fill = NULL
+  )
+
+p3 <- dams_no_geo |>
+  count(state, primaryDamTypeId) |>
+  mutate(state = fct_reorder(state, n, sum),
+         primaryDamTypeId = fct_reorder(primaryDamTypeId, n, sum)) |>
+  ggplot() +
+  geom_col(aes(x = n, y = state, fill = primaryDamTypeId),
+           position = "fill",
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  guides(fill = guide_legend(reverse = TRUE,
+                             ncol = 2)) +
+  theme(legend.position = "top")+
+  labs(
+    subtitle = "C: Primary dam type",
+    x = NULL,
+    y = NULL,
+    fill = NULL
+  )
+
+p1 + p2 + p3 +
+  plot_annotation(
+    title = "Basic counts: owner, purpose, dam type (proportion of each category)",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-count-by-state-ownertype-and-purpose
+#| fig-cap: "State by primary owner type and purpose - counts"
+#| fig-height: 12
+#| fig-width: 10
+#| column: page-right
+
+state_owner <- dams |>
+  st_drop_geometry() |>
+  count(primaryOwnerTypeId, state) |>
+  complete(primaryOwnerTypeId, state, fill = list(n = 0)) |>
+  mutate(primaryOwnerTypeId = fct_reorder(primaryOwnerTypeId, -n, sum),
+         state = fct_reorder(state, n, sum))
+
+p1 <- state_owner |>
+  ggplot(aes(x = primaryOwnerTypeId, y = state)) +
+  geom_tile(aes(fill = n),
+            alpha = 0.98) +
+  geom_text(aes(label = n),
+            color = "white",
+             size = 3) +
+  theme(plot.title.position = "plot",
+        axis.text.x = element_text(angle = 60, hjust = 0)
+        ) +
+  scale_x_discrete(position = "top") +
+  scale_fill_continuous(transform = scales::transform_log1p(),
+                        breaks = c(0, 10, 100, 1000, 10000)) +
+  guides(fill = "none") +
+  labs(
+    subtitle = "A: Primary owner type - count",
+    x = NULL,
+    y = NULL
+  )
+
+state_purpose <- dams |>
+  st_drop_geometry() |>
+  count(primaryPurposeId, state) |>
+  complete(primaryPurposeId, state, fill = list(n = 0)) |>
+  mutate(primaryPurposeId = fct_reorder(primaryPurposeId, -n, sum),
+         state = fct_reorder(state, n, sum))
+
+p2 <- state_purpose |>
+  ggplot(aes(x = primaryPurposeId, y = state)) +
+  geom_tile(aes(fill = n),
+            alpha = 0.98) +
+  geom_text(aes(label = n),
+            color = "white",
+             size = 3) +
+  theme(plot.title.position = "plot",
+        axis.text.x = element_text(angle = 60, hjust = 0)
+        ) +
+  scale_x_discrete(position = "top") +
+  scale_fill_continuous(transform = scales::transform_log1p(),
+                        breaks = c(0, 10, 100, 1000, 10000),
+                        ) + # transform_sqrt()) +
+  labs(
+    subtitle = "B: Primary purpose - count",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = "State by primary owner and primary purpose",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-dams-per-state
+#| fig-cap: "Number of dams"
+#| fig-height: 10
+#| fig-width: 12
+#| column: page-right
+#| eval: false
+
+p1 <- dams_ratios_per_state |>
+  ggplot() +
+  geom_col(aes(x = n_dams, y = state),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  labs(
+    subtitle = "A: Number of dams",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- dams_ratios_per_state_big |>
+  ggplot() +
+  geom_col(aes(x = n_dams, y = state),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  labs(
+    subtitle = "B: Number of big dams",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = glue("Number of dams"),
+    # subtitle = glue("Includes {n_dams_with_good_mod_data} ({percent(pct_dams_with_good_mod_data, accuracy = 1)}) dams with modification data"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-dam-ratios-by-state-pop-per-dam
+#| fig-cap: "Population per dam"
+#| fig-height: 10
+#| fig-width: 12
+#| column: page-right
+
+p1 <- dams_ratios_per_state |>
+  mutate(state = fct_reorder(state, pop_per_dam)) |>
+  ggplot() +
+  geom_col(aes(x = pop_per_dam, y = state),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  labs(
+    subtitle = "A: Population per dam",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- dams_ratios_per_state_big |>
+  mutate(state = fct_reorder(state, pop_per_dam)) |>
+  ggplot() +
+  geom_col(aes(x = pop_per_dam, y = state),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  labs(
+    subtitle = "B: Population per big dam",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = glue("Population per dam"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-dam-ratios-by-state-sqmi-per-dam
+#| fig-cap: "State area (sqmi) per dam"
+#| fig-height: 10
+#| fig-width: 12
+#| column: page-right
+
+p1 <- dams_ratios_per_state |>
+  mutate(state = fct_reorder(state, sqmi_per_dam)) |>
+  ggplot() +
+  geom_col(aes(x = sqmi_per_dam, y = state),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  labs(
+    subtitle = "A: All dams",
+    x = NULL,
+    y = NULL
+  )
+
+p2 <- dams_ratios_per_state_big |>
+  mutate(state = fct_reorder(state, sqmi_per_dam)) |>
+  ggplot() +
+  geom_col(aes(x = sqmi_per_dam, y = state),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  labs(
+    subtitle = "B: Big dams",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = glue("State sqmi per dam"),
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+```{r}
+#| label: fig-dam-ratios-by-state-median-surface-area-to-storage
+#| fig-cap: "Median `surfaceArea`::`nidStorage`"
+#| fig-height: 10
+#| fig-width: 12
+#| column: page-right
+#| warning: false
+
+dta_for_plot <- dams_with_pop |>
+  reframe(n_dams = n(),
+         median_surface_area_to_nidStorage = median(surfaceArea / nidStorage, na.rm = TRUE),
+         avg_surface_area_to_nidStorage = mean(surfaceArea / nidStorage, na.rm = TRUE),
+         .by = "state"
+  ) |>
+  mutate(state_label = glue("{state} ({n_dams})"),
+         state_label = fct_reorder(state_label, median_surface_area_to_nidStorage))
+
+n_dams_total = sum(dta_for_plot$n_dams)
+
+p1 <- dta_for_plot |>
+  ggplot() +
+  geom_col(aes(x = median_surface_area_to_nidStorage, 
+               width = pmax(15 * n_dams / n_dams_total, 0.02), 
+               y = state_label),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  theme(axis.ticks.y = element_blank()) +
+  labs(
+    subtitle = "A: All dams",
+    x = NULL,
+    y = NULL
+  )
+
+dta_for_plot_big <- dams_with_pop |>
+  filter(big_dam) |>
+  reframe(n_dams = n(),
+         median_surface_area_to_nidStorage = median(surfaceArea / nidStorage, na.rm = TRUE),
+         avg_surface_area_to_nidStorage = mean(surfaceArea / nidStorage, na.rm = TRUE),
+         .by = "state"
+  ) |>
+  mutate(state_label = glue("{state} ({n_dams})"),
+         state_label = fct_reorder(state_label, median_surface_area_to_nidStorage))
+
+n_dams_total_big = sum(dta_for_plot_big$n_dams)
+
+p2 <- dta_for_plot_big |>
+  ggplot() +
+  geom_col(aes(x = median_surface_area_to_nidStorage,
+               width = pmax(8 * n_dams / n_dams_total_big, 0.02),
+               y = state_label),
+           alpha = 0.7) +
+  scale_x_continuous(labels = label_number(scale_cut = cut_short_scale()),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_viridis_d(end =  0.9,
+                       direction = -1) +
+  theme(axis.ticks.y = element_blank()) +
+  labs(
+    subtitle = "B: Big dams",
+    x = NULL,
+    y = NULL
+  )
+
+p1 + p2 +
+  plot_annotation(
+    title = glue("Median dam `surfaceArea`::`nidStorage` by state"),
+    subtitle = "Vertical height reflects the relative number of dams in the state",
+    caption = my_caption
+  )
+
+```
+
+<br>
+
+I'm surprised Florida is so low in the ranking in panel A, given it's such a flat state. Also that it has 71 big dams (panel B).
+
+Looking deeper #1: all the big dams are privately owned by companies mining phosphorus, potash, etc. and nearly all have "tailings" as their primary purpose. (They have smaller dams in Florida too.)
+
+```{r}
+dams_no_geo |>
+  filter(big_dam,
+         state_abb == "FL") |>
+  select(nidId, name, ownerNames, primaryPurposeId, nidHeight, nidStorage) |>
+  reframe(
+    n_dams = n(),
+    `nidStorage median` = median(nidStorage),
+    `nidStorage smallest` = min(nidStorage),
+    `nidStorage largest` = max(nidStorage),
+    `nidHeight median` = median(nidHeight),
+    `nidHeight smallest` = min(nidHeight),
+    `nidHeight largest` = max(nidHeight),
+    .by = ownerNames
+  ) |>
+  arrange(desc(`nidStorage median`), `nidHeight median`) |>
+  gt() |>
+  tab_header(md("**Big dams in Florida are owned by mining companies**")) |>
+  fmt_number(columns = is.numeric,
+             decimals = 0)
+
+```
+
+<br>
+
+Looking deeper #2: Regarding dams with the highest nidStorage_median owned by PCS PHOSPHATE (a subsidiary of Nutrien):
+
+* It's suspicious that median, smallest, and largest are all the same size -- are the entries duplicates, or are there data errors? It's very unlikely that three dams would manage exactly the same amount of water or be exactly the same height.
+* Each dam has it's own name and nidId, and long/lat coordinates are different.
+* I verified the dams on Google maps: there are three separate holding ponds very close to each other, located in North Florida about halfway between Tallahassee and Jacksonville.
+* Thus is seems some of the data fields were duplicated, but not all:
+
+```{r}
+dams_no_geo |>
+  filter(big_dam,
+         state_abb == "FL",
+         ownerNames == "PCS PHOSPHATE") |>
+  select(nidId, name, ownerNames, `primary PurposeId` = primaryPurposeId, nidHeight, nidStorage, `surface Area` = surfaceArea, longitude, latitude) |>
+  arrange(nidId) |>
+  gt() |>
+  tab_header(md("**PCS PHOSPHATE's big dams seem to have some duplicated data in the NID**")) |>
+  fmt_number(columns = starts_with("nid"),
+             decimals = 0)
+
+```
+
+<br>

@@ -1,0 +1,29 @@
+# Summary {#sec-summary}
+
+```{r}
+#| label: setup
+#| include: false
+
+source(here::here("scripts/setup.R"))
+
+source(here::here("scripts/prepare-data.R"))
+
+```
+
+There were `r nrow(dams_all)` dams, dykes, locks and levees in the National Inventory of Dams when I downloaded the data set on `r nid_download_date`. I removed secondary structures, levees and dykes not associated with dams, and structures outside the continental USA, leaving `r n_dams` dams.^[To simplify data acquisition, analysis and visualizations, I focus on the continental USA rather than including all states, districts, and territories. See discussion in *@sec-notes Notes and limitations* ]. In the cleaned data set there are `r n_dams_big` big dams (defined as having a height of at least `r big_dam_height_cutoff` feet), which is about `r percent(n_dams_big / n_dams)` of the dams.
+
+Dams serve many purposes, and as noted in the *@sec-intro Introduction*, can be dangerous. Dams are assigned risk levels, and some dams need an emergency action plans (EAPs). In general, risk level and the existence of EAPs seem to be sensibly correlated, but there are high risk dams without EAPs. See *@sec-risks Risks*. 
+
+American civil infrastructure is under-funded. The American Society of Civil Engineers (ASCE) projects that in the years 2024-2033, dams and levees will have the greatest gap of all infrastructure categories in funding as proportion unmet_need::projected_need. This is despite there being so many dams (or perhaps partly because there are so many). In dollar terms, the ASCE projects larger gaps for some other infrastructure categories as noted in *@sec-asce-grades Infrastructure grades*.
+
+So where are the dams? In short, nearly everywhere. See *@sec-dam-maps Maps*.
+
+Dams come in many sizes and types, and the amount of water and its surface area behind dams varies widely. The distributions of many metrics are approximately log-normal. See *@sec-explore-numbers Numbers*.
+
+The drainage basins served by dams vary widely. See *@sec-drainage Drainage*.
+
+Terrain ruggedness index (TRI) is a quantification of the roughness of the land. What can we learn from this? Perhaps more than you expect. See *@sec-ruggedness Terrain ruggedness*.
+
+Nearly all dams are the origin of a waterway or or a break in its flow. See *@sec-dams-and-waterways Dams, waterways, and watersheds*.
+
+See *@sec-notes Notes*.
