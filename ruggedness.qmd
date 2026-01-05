@@ -2406,7 +2406,7 @@ p2 <- dta_for_model |>
 p1 + p2 + 
   plot_annotation(
     title = "tri_mean<sub>dam</sub> by nidStorage<br>for local areas around dams",
-    caption = my_caption_nid_opentopography_self_only
+    caption = my_caption_nid_opentopography
   ) &
   theme(plot.title = element_textbox_simple(),
         plot.subtitle = element_textbox_simple())
