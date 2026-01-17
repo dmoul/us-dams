@@ -2,8 +2,6 @@
 
 Daniel Moul
 
-*This report is currently in draft. I welcome any feedback to make it better. --Daniel*
-
 Having learned of the existence of the US National Inventory of Dams, I started wondering ...
 
 * How many dams are there? And where are they? 
